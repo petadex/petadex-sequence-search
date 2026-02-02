@@ -2,9 +2,11 @@ import boto3
 import subprocess
 import os
 import json
+import uuid
 from pathlib import Path
 
-S3_BUCKET = "petadex-sequence-db"
+S3_BUCKET = "petadex"  # Explicitly set for standalone viability
+PREFIX = "mmseqs2/"
 DB_CACHE_PATH = "/tmp/enzyme_fastaa_mmseqs"
 
 def download_database():
@@ -12,48 +14,74 @@ def download_database():
     Download MMseqs2 database from S3 to /tmp
     Only downloads if not already cached
     """
-    
-    # Check if already cached
-    if os.path.exists(f"{DB_CACHE_PATH}.index"):
-        print("Database already cached in /tmp")
-        return DB_CACHE_PATH
-    
-    print("Downloading database from S3...")
-    s3 = boto3.client('s3')
-    
+
+    s3 = boto3.client('s3', region_name='us-east-1')
+
     # Get latest version
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key="mmseqs2/LATEST")
-        latest_version = obj['Body'].read().decode('utf-8').strip()
-        print(f"Latest version: {latest_version}")
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{PREFIX}LATEST")
+        latest_version = obj['Body'].read().decode('utf-8').strip().rstrip('/')
+        print(f"Targeting database version: {latest_version}")
     except Exception as e:
         print(f"Error reading LATEST pointer: {e}")
         raise
-    
+
     # List all database files
-    prefix = f"mmseqs2/{latest_version}/"
+    prefix = f"{PREFIX}{latest_version}/"
     response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-    
+
     if 'Contents' not in response:
         raise Exception(f"No database files found at {prefix}")
-    
+
+    # Extract database base name from first file (before downloading)
+    db_base_name = None
+    for obj in response['Contents']:
+        key = obj['Key']
+        filename = key.split('/')[-1]
+
+        # Skip directory markers and metadata
+        if not filename or filename.endswith('/') or filename == 'metadata.json':
+            continue
+
+        # Get base name by removing file extensions
+        db_base_name = filename.split('.')[0]
+        if db_base_name.endswith('_h'):
+            db_base_name = db_base_name[:-2]
+        break
+
+    if db_base_name is None:
+        raise Exception("Could not determine database base name from files")
+
+    actual_db_path = f"/tmp/{db_base_name}"
+    print(f"Detected database base: {actual_db_path}")
+
+    # Check if already cached BEFORE downloading
+    if os.path.exists(f"{actual_db_path}.index"):
+        print("Database already cached in /tmp")
+        return actual_db_path
+
+    print("Downloading database from S3...")
+
     # Download each file
     for obj in response['Contents']:
         key = obj['Key']
         filename = key.split('/')[-1]
-        
+
+        # Skip directory markers
+        if not filename or filename.endswith('/'):
+            print(f"Skipping directory marker: {key}")
+            continue
+
         # Skip metadata file
         if filename == 'metadata.json':
             continue
-        
-        # Reconstruct expected local path
+
         local_path = f"/tmp/{filename}"
-        
         print(f"Downloading {filename} ({obj['Size']/1024/1024:.2f} MB)...")
         s3.download_file(S3_BUCKET, key, local_path)
-    
+
     print("Database download complete")
-    return DB_CACHE_PATH
+    return actual_db_path
 
 def validate_sequence(sequence):
     """Validate input protein sequence"""
@@ -75,20 +103,20 @@ def validate_sequence(sequence):
     
     return sequence.upper()
 
-def run_search(query_sequence, db_path, max_results=50):
+def run_search(query_sequence, db_path, session_id, max_results=50):
     """
-    Run MMseqs2 search against database
-    Returns list of matches with similarity metrics
+    Run MMseqs2 search and upload results to S3
+    Returns S3 key for the results file
     """
-    
+
     # Write query to temp file
     query_file = "/tmp/query.fasta"
     with open(query_file, 'w') as f:
         f.write(f">query\n{query_sequence}\n")
-    
+
     # Output file
     result_file = "/tmp/results.tsv"
-    
+
     # Run MMseqs2 easy-search
     print(f"Running MMseqs2 search...")
     result = subprocess.run([
@@ -100,13 +128,13 @@ def run_search(query_sequence, db_path, max_results=50):
         "--format-output", "target,qstart,qend,tstart,tend,alnlen,fident,evalue,bits",
         "--max-seqs", str(max_results)
     ], capture_output=True, text=True)
-    
+
     if result.returncode != 0:
         print(f"MMseqs2 error: {result.stderr}")
         raise Exception(f"MMseqs2 search failed: {result.stderr}")
-    
+
     print(f"Search complete")
-    
+
     # Parse results
     results = []
     if os.path.exists(result_file):
@@ -125,62 +153,137 @@ def run_search(query_sequence, db_path, max_results=50):
                         'evalue': float(parts[7]),
                         'bitscore': float(parts[8])
                     })
-    
-    return results
+
+    # Upload to S3
+    job_id = str(uuid.uuid4())
+    s3_key = f"results/{session_id}/{job_id}.json"
+
+    s3 = boto3.client('s3', region_name='us-east-1')
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=json.dumps({
+            'query_length': len(query_sequence),
+            'num_results': len(results),
+            'results': results
+        }),
+        ContentType='application/json'
+    )
+
+    print(f"Results uploaded to s3://{S3_BUCKET}/{s3_key}")
+    return job_id
+
+def get_history(session_id):
+    """
+    List all search results for a given session
+    Returns list of job metadata
+    """
+    s3 = boto3.client('s3', region_name='us-east-1')
+    prefix = f"results/{session_id}/"
+
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+
+    if 'Contents' not in response:
+        return []
+
+    history = []
+    for obj in response['Contents']:
+        key = obj['Key']
+        # Extract job_id from path: results/{sessionId}/{job_id}.json
+        job_id = key.split('/')[-1].replace('.json', '')
+        history.append({
+            'job_id': job_id,
+            's3_key': key,
+            'last_modified': obj['LastModified'].isoformat(),
+            'size': obj['Size']
+        })
+
+    # Sort by last_modified descending (most recent first)
+    history.sort(key=lambda x: x['last_modified'], reverse=True)
+    return history
+
 
 def handler(event, context):
     """
     Lambda handler function
-    
-    Expected input:
+
+    Expected input for search:
     {
+        "action": "search",  // optional, default
+        "sessionId": "abc123",
         "sequence": "MKLLIVLLA...",
         "max_results": 50  // optional
     }
-    
-    Returns:
+
+    Expected input for history:
     {
-        "query_length": 150,
-        "num_results": 25,
-        "results": [...]
+        "action": "history",
+        "sessionId": "abc123"
+    }
+
+    Returns for search:
+    {
+        "job_id": "uuid",
+        "s3_key": "results/{sessionId}/{job_id}.json"
+    }
+
+    Returns for history:
+    {
+        "history": [...]
     }
     """
     
     try:
         print(f"Event: {json.dumps(event)}")
-        
+
         # Parse input
         if isinstance(event.get('body'), str):
             body = json.loads(event['body'])
         else:
             body = event
-        
+
+        action = body.get('action', 'search')
+        session_id = body.get('sessionId')
+
+        if not session_id:
+            raise ValueError("sessionId is required")
+
+        # Route by action
+        if action == 'history':
+            history = get_history(session_id)
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'history': history})
+            }
+
+        # Default: search action
         query_sequence = body.get('sequence', '').strip()
         max_results = body.get('max_results', 50)
-        
+
         # Validate sequence
         query_sequence = validate_sequence(query_sequence)
-        
+
         # Download database (cached after first invocation)
         db_path = download_database()
-        
+
         # Run search
-        results = run_search(query_sequence, db_path, max_results)
-        
-        # Return results
-        response = {
-            'query_length': len(query_sequence),
-            'num_results': len(results),
-            'results': results
-        }
-        
+        job_id = run_search(query_sequence, db_path, session_id, max_results)
+
+        # Return job ID
         return {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*'
             },
-            'body': json.dumps(response)
+            'body': json.dumps({
+                'job_id': job_id,
+                's3_key': f"results/{session_id}/{job_id}.json"
+            })
         }
         
     except ValueError as e:
