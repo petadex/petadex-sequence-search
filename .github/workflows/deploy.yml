@@ -10,11 +10,13 @@ env:
   ECR_REPOSITORY: petadex-sequence-search
   LAMBDA_FUNCTION: petadex-sequence-search
 
+permissions:
+  contents: write # for tagging
+  id-token: write
+
 jobs:
   version:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       new_tag: ${{ steps.tag.outputs.new_tag }}
     steps:
