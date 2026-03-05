@@ -7,8 +7,8 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: petadex-sequence-search
-  LAMBDA_FUNCTION: petadex-sequence-search
+  ECR_REPOSITORY: petadex-mmseq2-search
+  LAMBDA_FUNCTION: petadex-mmseqs2-search
 
 permissions:
   contents: write # for tagging
