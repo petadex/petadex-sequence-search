@@ -124,6 +124,19 @@ def download_database():
     return actual_db_path
 
 
+def parse_fasta(raw):
+    """Parse a FASTA string into (header, sequence). Also accepts bare sequence."""
+    raw = raw.strip()
+    if raw.startswith(">"):
+        lines = raw.splitlines()
+        header = lines[0][1:].strip()  # strip leading '>'
+        sequence = "".join(lines[1:])
+    else:
+        header = None
+        sequence = raw
+    return header, sequence
+
+
 def validate_sequence(sequence):
     """Validate input protein sequence"""
 
@@ -145,7 +158,7 @@ def validate_sequence(sequence):
     return sequence.upper()
 
 
-def run_search(query_sequence, db_path, session_id, max_results=50):
+def run_search(query_sequence, db_path, session_id, max_results=50, query_header=None):
     """
     Run MMseqs2 search and upload results to S3
     Returns S3 key for the results file
@@ -221,6 +234,8 @@ def run_search(query_sequence, db_path, session_id, max_results=50):
         Key=s3_key,
         Body=json.dumps(
             {
+                "query_header": query_header,
+                "query_sequence": query_sequence,
                 "query_length": len(query_sequence),
                 "num_results": len(results),
                 "results": results,
@@ -334,8 +349,11 @@ def handler(event, context):
             }
 
         # Default: search action
-        query_sequence = body.get("sequence", "").strip()
+        raw_input = body.get("sequence", "").strip()
         max_results = body.get("max_results", 50)
+
+        # Parse FASTA (supports both ">header\nsequence" and bare sequence)
+        query_header, query_sequence = parse_fasta(raw_input)
 
         # Validate sequence
         query_sequence = validate_sequence(query_sequence)
@@ -344,7 +362,7 @@ def handler(event, context):
         db_path = download_database()
 
         # Run search
-        job_id = run_search(query_sequence, db_path, session_id, max_results)
+        job_id = run_search(query_sequence, db_path, session_id, max_results, query_header)
 
         # Return job ID
         return {
