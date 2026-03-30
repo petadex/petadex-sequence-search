@@ -3,11 +3,50 @@ import subprocess
 import os
 import json
 import uuid
+import psycopg2
+import psycopg2.extras
 from pathlib import Path
 
-S3_BUCKET = "petadex"  # Explicitly set for standalone viability
+S3_BUCKET = "petadex"
 PREFIX = "mmseqs2/"
 DB_CACHE_PATH = "/tmp/enzyme_fastaa_mmseqs"
+DB_HOST = "petadex.ccz9y6yshbls.us-east-1.rds.amazonaws.com"
+DB_NAME = "petadex"
+
+_db_secret_cache = None
+
+def get_db_credentials():
+    global _db_secret_cache
+    if _db_secret_cache:
+        return _db_secret_cache
+    sm = boto3.client("secretsmanager", region_name="us-east-1")
+    secret = json.loads(sm.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
+    _db_secret_cache = secret
+    return secret
+
+
+def fetch_metadata(accession_ids):
+    """Fetch BLAST_NR_METADATA rows for a list of genbank_accession_ids."""
+    if not accession_ids:
+        return {}
+    creds = get_db_credentials()
+    conn = psycopg2.connect(
+        host=DB_HOST, dbname=DB_NAME,
+        user=creds["username"], password=creds["password"],
+        connect_timeout=5
+    )
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT genbank_accession_id, organism, protein_id, definition,
+                          taxonomy, journal, collection_date, country
+                   FROM "BLAST_NR_METADATA"
+                   WHERE genbank_accession_id = ANY(%s)""",
+                (list(accession_ids),)
+            )
+            return {row["genbank_accession_id"]: dict(row) for row in cur.fetchall()}
+    finally:
+        conn.close()
 
 
 def download_database():
@@ -165,6 +204,12 @@ def run_search(query_sequence, db_path, session_id, max_results=50):
                             "bitscore": float(parts[8]),
                         }
                     )
+
+    # Enrich results with metadata
+    accession_ids = {r["target_id"] for r in results}
+    metadata = fetch_metadata(accession_ids)
+    for r in results:
+        r["metadata"] = metadata.get(r["target_id"])
 
     # Upload to S3
     job_id = str(uuid.uuid4())
