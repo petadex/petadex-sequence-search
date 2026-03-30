@@ -40,7 +40,7 @@ def fetch_metadata(accession_ids):
             cur.execute(
                 """SELECT genbank_accession_id, organism, protein_id, definition,
                           taxonomy, journal, collection_date, country
-                   FROM "BLAST_NR_METADATA"
+                   FROM blast_nr_metadata
                    WHERE genbank_accession_id = ANY(%s)""",
                 (list(accession_ids),)
             )
