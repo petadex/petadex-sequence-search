@@ -82,3 +82,64 @@ jobs:
           aws lambda update-function-code \
             --function-name $LAMBDA_FUNCTION \
             --image-uri $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Wait for Lambda update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION
+
+      - name: Regenerate example searches
+        run: |
+          python3 - <<'EOF'
+          import boto3, json, re
+
+          lambda_client = boto3.client('lambda', region_name='us-east-1')
+          s3 = boto3.client('s3', region_name='us-east-1')
+          BUCKET = 'petadex'
+
+          # Parse example-sequences.txt
+          examples = []
+          with open('example-sequences.txt') as f:
+              current_header, current_seq = None, []
+              for line in f:
+                  line = line.rstrip()
+                  if line.startswith('>'):
+                      if current_header:
+                          examples.append((current_header, '\n'.join(current_seq)))
+                      current_header = line[1:].strip()
+                      current_seq = []
+                  elif line:
+                      current_seq.append(line)
+              if current_header:
+                  examples.append((current_header, '\n'.join(current_seq)))
+
+          for name, sequence in examples:
+              slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+              example_key = f'example_{slug}'
+              session_id = f'regen_{example_key}'
+              fasta = f'>{name}\n{sequence}'
+
+              print(f'Invoking Lambda for {example_key}...')
+              resp = lambda_client.invoke(
+                  FunctionName='petadex-mmseqs2-search',
+                  Payload=json.dumps({'sessionId': session_id, 'sequence': fasta, 'max_results': 50}),
+                  InvocationType='RequestResponse'
+              )
+              body = json.loads(json.loads(resp['Payload'].read())['body'])
+              job_id = body['job_id']
+
+              # Delete old example file if it exists
+              try:
+                  s3.delete_object(Bucket=BUCKET, Key=f'results/{example_key}.json')
+                  print(f'  Deleted old results/{example_key}.json')
+              except Exception:
+                  pass
+
+              # Copy new result to example key
+              s3.copy_object(
+                  Bucket=BUCKET,
+                  CopySource={'Bucket': BUCKET, 'Key': f'results/{session_id}/{job_id}.json'},
+                  Key=f'results/{example_key}.json'
+              )
+              print(f'  ✓ Updated results/{example_key}.json')
+          EOF
