@@ -2,6 +2,7 @@ import boto3
 import subprocess
 import os
 import json
+import time
 import uuid
 import psycopg2
 import psycopg2.extras
@@ -174,6 +175,7 @@ def run_search(query_sequence, db_path, session_id, max_results=50, query_header
 
     # Run MMseqs2 easy-search
     print(f"Running MMseqs2 search...")
+    t0 = time.time()
     result = subprocess.run(
         [
             "mmseqs",
@@ -190,6 +192,7 @@ def run_search(query_sequence, db_path, session_id, max_results=50, query_header
         capture_output=True,
         text=True,
     )
+    print(f"TIMING mmseqs_search: {time.time() - t0:.2f}s")
 
     if result.returncode != 0:
         print(f"MMseqs2 error: {result.stderr}")
@@ -359,7 +362,9 @@ def handler(event, context):
         query_sequence = validate_sequence(query_sequence)
 
         # Download database (cached after first invocation)
+        t0 = time.time()
         db_path = download_database()
+        print(f"TIMING database_download: {time.time() - t0:.2f}s")
 
         # Run search
         job_id = run_search(query_sequence, db_path, session_id, max_results, query_header)
