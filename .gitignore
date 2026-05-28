@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 # PETadex specific
+CLAUDE.md
+
 # AWS credentials and sensitive data
 petadex-s3-credentials.txt
 *credentials*.txt
