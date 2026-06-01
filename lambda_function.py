@@ -301,6 +301,15 @@ def get_history(session_id):
     return history
 
 
+# Eager-download at module init so the cost is paid during Lambda init
+# (and pre-paid during provisioned concurrency allocation) instead of on
+# the first request. Container is locked to whatever DB version was current
+# at init time; re-publish the Lambda version to pick up a DB update.
+_init_t0 = time.time()
+DB_PATH = download_database()
+print(f"TIMING init_database_download: {time.time() - _init_t0:.2f}s")
+
+
 def handler(event, context):
     """
     Lambda handler function
@@ -368,13 +377,8 @@ def handler(event, context):
         # Validate sequence
         query_sequence = validate_sequence(query_sequence)
 
-        # Download database (cached after first invocation)
-        t0 = time.time()
-        db_path = download_database()
-        print(f"TIMING database_download: {time.time() - t0:.2f}s")
-
-        # Run search
-        job_id = run_search(query_sequence, db_path, session_id, max_results, query_header)
+        # Run search (DB was downloaded at module init)
+        job_id = run_search(query_sequence, DB_PATH, session_id, max_results, query_header)
 
         # Return job ID
         return {
