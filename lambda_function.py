@@ -1,4 +1,5 @@
 import boto3
+from boto3.s3.transfer import TransferConfig
 import subprocess
 import os
 import json
@@ -13,6 +14,12 @@ PREFIX = "mmseqs2/"
 DB_CACHE_PATH = "/tmp/enzyme_fastaa_mmseqs"
 DB_HOST = "petadex.ccz9y6yshbls.us-east-1.rds.amazonaws.com"
 DB_NAME = "petadex"
+
+S3_TRANSFER_CONFIG = TransferConfig(
+    multipart_chunksize=32 * 1024 * 1024,
+    max_concurrency=32,
+    use_threads=True,
+)
 
 _db_secret_cache = None
 
@@ -119,7 +126,7 @@ def download_database():
 
         local_path = f"/tmp/{filename}"
         print(f"Downloading {filename} ({obj['Size'] / 1024 / 1024:.2f} MB)...")
-        s3.download_file(S3_BUCKET, key, local_path)
+        s3.download_file(S3_BUCKET, key, local_path, Config=S3_TRANSFER_CONFIG)
 
     print("Database download complete")
     return actual_db_path
