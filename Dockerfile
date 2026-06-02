@@ -3,7 +3,9 @@ FROM public.ecr.aws/lambda/python:3.11
 # Install system dependencies + Build tools for Biopython/NumPy and DIAMOND.
 # gcc/gcc-c++/python3-devel are mandatory for Biopython; cmake/make/zlib-devel
 # are needed to build DIAMOND from source (see below).
-RUN yum install -y wget tar gzip gcc gcc-c++ python3-devel cmake make zlib-devel
+# NOTE: cmake3 (3.17 on AL2), not cmake — the base image's default `cmake` is
+# 2.8.12, too old for the `cmake -S/-B` out-of-source syntax below (needs ≥3.13).
+RUN yum install -y wget tar gzip gcc gcc-c++ python3-devel cmake3 make zlib-devel
 
 # Install MMseqs2 (arm64 for Apple Silicon & AWS Graviton).
 # KEPT during the DIAMOND transition — the legacy single-Lambda search path
@@ -23,8 +25,8 @@ ARG DIAMOND_VERSION=2.1.11
 RUN wget -O diamond.tar.gz \
       https://github.com/bbuchfink/diamond/archive/refs/tags/v${DIAMOND_VERSION}.tar.gz && \
     tar xzf diamond.tar.gz && \
-    cmake -S diamond-${DIAMOND_VERSION} -B diamond-build -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build diamond-build -j "$(nproc)" && \
+    cmake3 -S diamond-${DIAMOND_VERSION} -B diamond-build -DCMAKE_BUILD_TYPE=Release && \
+    cmake3 --build diamond-build -j "$(nproc)" && \
     cp diamond-build/diamond /usr/local/bin/ && \
     rm -rf diamond.tar.gz diamond-${DIAMOND_VERSION} diamond-build
 
