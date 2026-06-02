@@ -88,6 +88,42 @@ jobs:
           aws lambda wait function-updated \
             --function-name $LAMBDA_FUNCTION
 
+      # --- DIAMOND scale-out (transition; additive — legacy above is untouched) ---
+      # Updates CODE only on the three handlers that share this image. The
+      # functions + state machine are provisioned once by
+      # scripts/provision_diamond_infra.sh; these steps no-op (with a notice)
+      # until that bootstrap has run, so they never break the live pipeline.
+      - name: Update DIAMOND function code (orchestrator/worker/aggregator)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.version.outputs.new_tag }}
+        run: |
+          for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-aggregator; do
+            if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+              echo "Updating $FN -> $IMAGE_TAG"
+              aws lambda update-function-code --function-name "$FN" \
+                --image-uri $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG >/dev/null
+              aws lambda wait function-updated --function-name "$FN"
+            else
+              echo "::notice::$FN not provisioned yet (run scripts/provision_diamond_infra.sh) — skipping."
+            fi
+          done
+
+      - name: Update DIAMOND state machine definition
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          SM_ARN="arn:aws:states:${AWS_REGION}:${ACCOUNT_ID}:stateMachine:petadex-diamond-search"
+          if aws stepfunctions describe-state-machine --state-machine-arn "$SM_ARN" >/dev/null 2>&1; then
+            sed -e "s|\${WorkerFunctionArn}|arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:petadex-diamond-worker|g" \
+                -e "s|\${AggregatorFunctionArn}|arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:petadex-diamond-aggregator|g" \
+                infra/search_state_machine.asl.json > /tmp/definition.json
+            echo "Updating state machine definition for $SM_ARN"
+            aws stepfunctions update-state-machine --state-machine-arn "$SM_ARN" \
+              --definition file:///tmp/definition.json >/dev/null
+          else
+            echo "::notice::state machine not provisioned yet (run scripts/provision_diamond_infra.sh) — skipping."
+          fi
+
       - name: Regenerate example searches
         run: |
           python3 - <<'EOF'

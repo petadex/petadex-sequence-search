@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:797308887321:*"
+    },
+    {
+      "Sid": "ListParts",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::petadex",
+      "Condition": { "StringLike": { "s3:prefix": "results/*" } }
+    },
+    {
+      "Sid": "ReadParts",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::petadex/results/*/parts/*"
+    },
+    {
+      "Sid": "WriteResult",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::petadex/results/*"
+    },
+    {
+      "Sid": "ReadDbSecret",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "REPLACE_DB_SECRET_ARN"
+    }
+  ]
+}

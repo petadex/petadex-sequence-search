@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:797308887321:*"
+    },
+    {
+      "Sid": "ReadDiamondPointers",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::petadex/diamond/LATEST",
+        "arn:aws:s3:::petadex/diamond/*/manifest.json"
+      ]
+    },
+    {
+      "Sid": "ListResultsForHistory",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::petadex",
+      "Condition": { "StringLike": { "s3:prefix": "results/*" } }
+    },
+    {
+      "Sid": "StartSearchExecution",
+      "Effect": "Allow",
+      "Action": ["states:StartExecution"],
+      "Resource": "arn:aws:states:us-east-1:797308887321:stateMachine:petadex-diamond-search"
+    }
+  ]
+}

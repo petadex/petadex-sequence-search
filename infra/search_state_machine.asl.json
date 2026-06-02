@@ -1,0 +1,74 @@
+{
+  "Comment": "PETadex DIAMOND sharded search: fan out one worker per shard (Map), then aggregate. Fail-fast: any shard failure aborts the whole job. ${WorkerFunctionArn} and ${AggregatorFunctionArn} are substituted at deploy time.",
+  "StartAt": "FanOutShards",
+  "States": {
+    "FanOutShards": {
+      "Type": "Map",
+      "ItemsPath": "$.shards",
+      "MaxConcurrency": 0,
+      "ItemSelector": {
+        "sessionId.$": "$.sessionId",
+        "jobId.$": "$.jobId",
+        "maxResults.$": "$.maxResults",
+        "shardIndex.$": "$$.Map.Item.Value.shardIndex",
+        "shardKey.$": "$$.Map.Item.Value.shardKey",
+        "queryFasta.$": "States.Format('>query\n{}', $.querySequence)"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "SearchShard",
+        "States": {
+          "SearchShard": {
+            "Type": "Task",
+            "Resource": "${WorkerFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.workerResults",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "JobFailed" }
+      ],
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "${AggregatorFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "JobFailed" }
+      ],
+      "End": true
+    },
+    "JobFailed": {
+      "Type": "Fail",
+      "Error": "ShardSearchFailed",
+      "Cause": "One or more shard workers (or the aggregator) failed; job aborted (fail-fast, see Scale-Out Plan Phase 5)."
+    }
+  }
+}
