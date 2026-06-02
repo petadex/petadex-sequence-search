@@ -106,7 +106,7 @@ def download_database():
     # Check if already cached BEFORE downloading
     if os.path.exists(f"{actual_db_path}.index"):
         print("Database already cached in /tmp")
-        return actual_db_path
+        return actual_db_path, latest_version
 
     print("Downloading database from S3...")
 
@@ -129,7 +129,7 @@ def download_database():
         s3.download_file(S3_BUCKET, key, local_path, Config=S3_TRANSFER_CONFIG)
 
     print("Database download complete")
-    return actual_db_path
+    return actual_db_path, latest_version
 
 
 def parse_fasta(raw):
@@ -248,6 +248,15 @@ def run_search(query_sequence, db_path, session_id, max_results=50, query_header
                 "query_sequence": query_sequence,
                 "query_length": len(query_sequence),
                 "num_results": len(results),
+                # Corpus identity (additive; web app ignores unknown keys). This
+                # is the legacy MMseqs2/nr (~1M) path — labeled so a result is
+                # self-identifying vs the DIAMOND/Logan (300M) path. The matching
+                # fields are set in aggregator.py. `database` is the mmseqs2 DB
+                # version prefix; db_sequence_count is unknown here (nr subset).
+                "engine": "mmseqs2",
+                "database": f"{PREFIX}{DB_VERSION}",
+                "database_version": DB_VERSION,
+                "db_sequence_count": None,
                 "results": results,
             }
         ),
@@ -306,7 +315,7 @@ def get_history(session_id):
 # the first request. Container is locked to whatever DB version was current
 # at init time; re-publish the Lambda version to pick up a DB update.
 _init_t0 = time.time()
-DB_PATH = download_database()
+DB_PATH, DB_VERSION = download_database()
 print(f"TIMING init_database_download: {time.time() - _init_t0:.2f}s")
 
 

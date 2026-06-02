@@ -70,23 +70,32 @@ def resolve_version(requested=None):
 
 
 def load_shards(version):
-    """Read the version's manifest.json and return the worker shard list."""
+    """Read the version's manifest.json; return (shards, db_meta).
+
+    db_meta carries the corpus identity (source FASTA + sequence count) so the
+    aggregator can stamp it into the result — that is what lets a reader tell a
+    300M-Logan search from the 1M-nr legacy path without inspecting hit IDs.
+    """
     key = f"{DIAMOND_PREFIX}/{version}/manifest.json"
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
     manifest = json.loads(obj["Body"].read())
     shards = [
         # shardSeqs (per-shard sequence count, from the manifest) rides along for
         # the timing telemetry's shard-count benchmark; the worker records it.
-        {"shardIndex": s["index"], "shardKey": s["key"], "shardSeqs": s.get("seqs")}
+        {"shardIndex": s["index"], "shardKey": s["key"], "shardSeqs": s.get("sequences")}
         for s in manifest["shards"]
     ]
     if not shards:
         raise RuntimeError(f"manifest {key} lists no shards")
-    return shards
+    db_meta = {
+        "corpus": manifest.get("corpus"),
+        "dbSequenceCount": manifest.get("total_sequences"),
+    }
+    return shards, db_meta
 
 
 def start_search(session_id, job_id, version, query_header, query_sequence,
-                 max_results, shards):
+                 max_results, shards, db_meta):
     """Start the Step Functions Map execution. Returns immediately (async).
 
     The execution input carries `querySequence`/`queryHeader` (not a prebuilt
@@ -107,6 +116,10 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         "querySequence": query_sequence,
         "maxResults": max_results,
         "shards": shards,
+        # Corpus identity, stamped into the result by the aggregator so a search
+        # is self-identifying as Logan (300M) vs the legacy nr (1M) path.
+        "corpus": db_meta.get("corpus"),
+        "dbSequenceCount": db_meta.get("dbSequenceCount"),
     }
     # Name the execution after the job for traceability + idempotency (a retried
     # invoke with the same jobId collides instead of double-fanning-out).
@@ -180,12 +193,12 @@ def handler(event, context):
 
         # Pin the version once, read the shard list, fan out via Step Functions.
         version = resolve_version(body.get("version"))
-        shards = load_shards(version)
+        shards, db_meta = load_shards(version)
         job_id = str(uuid.uuid4())
 
         t0 = time.time()
         start_search(session_id, job_id, version, query_header, query_sequence,
-                     max_results, shards)
+                     max_results, shards, db_meta)
         print(f"TIMING start_execution: {time.time() - t0:.2f}s "
               f"(version={version}, shards={len(shards)}, jobId={job_id})")
 

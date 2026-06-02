@@ -150,6 +150,35 @@ def test_write_job_timing_marks_missing_shards():
     assert by_idx[0]["status"] == "failed"
 
 
+def test_aggregator_stamps_database_identity():
+    """Success path: the result JSON self-identifies as the DIAMOND/Logan corpus
+    (engine/database/version/seq-count), so it can't be confused with nr."""
+    fake = FakeS3()
+    aggregator.s3 = fake
+    aggregator.fetch_metadata = lambda ids: {}  # no RDS
+    # One shard part + its sidecar so the part-count cross-check passes.
+    fake.store["results/sess/job/parts/shard_0.tsv"] = (
+        b"target1\t1\t10\t1\t10\t10\t55.5\t1e-50\t200\n")
+    _seed_sidecar(fake, "job", 0)
+
+    event = {
+        "sessionId": "sess", "jobId": "job", "version": "catalytic_orfs_v1.1_x",
+        "querySequence": "MKLLIVL", "queryHeader": ">q", "maxResults": 50,
+        "corpus": "s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa",
+        "dbSequenceCount": 307155746,
+        "shards": [{"shardIndex": 0}],
+    }
+    aggregator.handler(event, None)
+
+    doc = json.loads(fake.store["results/sess/job.json"])
+    assert doc["engine"] == "diamond"
+    assert doc["database"] == "s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa"
+    assert doc["database_version"] == "catalytic_orfs_v1.1_x"
+    assert doc["db_sequence_count"] == 307155746
+    # The contract fields are still present and unchanged.
+    assert doc["num_results"] == 1 and "results" in doc
+
+
 def test_aggregator_timing_only_mode():
     """timing-only invocation writes a failed rollup and no result JSON."""
     fake = FakeS3()

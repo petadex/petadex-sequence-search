@@ -258,6 +258,15 @@ def handler(event, context):
         "query_sequence": query_sequence,
         "query_length": len(query_sequence),
         "num_results": len(results),
+        # Corpus identity (additive fields; the web app ignores unknown keys).
+        # These make a result self-identifying as the DIAMOND/Logan 300M path —
+        # `engine: diamond`, the corpus FASTA, the version, and the full DB seq
+        # count — vs the legacy MMseqs2/nr 1M path. See lambda_function.py for
+        # the matching fields on the legacy side.
+        "engine": "diamond",
+        "database": event.get("corpus"),
+        "database_version": event.get("version"),
+        "db_sequence_count": event.get("dbSequenceCount"),
         "results": results,
     }
     result_key = f"results/{session_id}/{job_id}.json"
