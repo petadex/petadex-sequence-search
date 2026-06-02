@@ -39,6 +39,7 @@ import json
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 
@@ -74,7 +75,9 @@ def load_shards(version):
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
     manifest = json.loads(obj["Body"].read())
     shards = [
-        {"shardIndex": s["index"], "shardKey": s["key"]}
+        # shardSeqs (per-shard sequence count, from the manifest) rides along for
+        # the timing telemetry's shard-count benchmark; the worker records it.
+        {"shardIndex": s["index"], "shardKey": s["key"], "shardSeqs": s.get("seqs")}
         for s in manifest["shards"]
     ]
     if not shards:
@@ -97,6 +100,9 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         "sessionId": session_id,
         "jobId": job_id,
         "version": version,
+        # Job start stamp, threaded through so the aggregator can compute
+        # total_wall_ms (it has no other way to know when the job began).
+        "submittedAt": datetime.now(timezone.utc).isoformat(),
         "queryHeader": query_header,
         "querySequence": query_sequence,
         "maxResults": max_results,

@@ -39,9 +39,11 @@ column is already a percentage in [0,100]. The legacy MMseqs2 code multiplies
 worker emits the raw column untouched; the assertion lives in the merger.
 """
 
+import json
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -145,6 +147,42 @@ def run_shard_search(query_fasta, db_path, max_results):
     return ""
 
 
+def write_shard_timing(session_id, job_id, shard_index, timings, status, error=None):
+    """Persist this worker's timing as a standalone sidecar object.
+
+    Written for EVERY shard — success or failure — from the handler's `finally`
+    block, so a job that later aborts under fail-fast still leaves a per-shard
+    breadcrumb the aggregator can roll up. Telemetry must never be the thing that
+    fails a search, so this logs and swallows any error rather than raising: a
+    failed timing write degrades to "no timing for this shard," not a crash.
+
+    Sidecar key (beside the result part, under parts/):
+        results/{sessionId}/{jobId}/parts/shard_{shardIndex}.meta.json
+    """
+    try:
+        doc = {
+            "shard_index": shard_index,
+            "download_ms": timings.get("download_ms"),
+            "search_ms": timings.get("search_ms"),
+            "total_ms": timings.get("total_ms"),
+            # Dual-purpose telemetry (Phase 7): size + seq count let real traffic
+            # feed the diminishing-returns / shard-count benchmark, not just ops.
+            "shard_size_bytes": timings.get("shard_size_bytes"),
+            "shard_seq_count": timings.get("shard_seq_count"),
+            "num_hits": timings.get("num_hits"),
+            "status": status,
+            "error": error,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.meta.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=key,
+                      Body=json.dumps(doc).encode(),
+                      ContentType="application/json")
+        print(f"wrote timing sidecar -> s3://{S3_BUCKET}/{key}")
+    except Exception as e:
+        print(f"WARN write_shard_timing failed (shard {shard_index}): {e}")
+
+
 def handler(event, context):
     """Search one shard and write its partial TSV to S3. Fail-fast: any error
     raises so the Step Functions Map branch fails the whole job."""
@@ -157,23 +195,49 @@ def handler(event, context):
     query_fasta = event["queryFasta"]
     max_results = int(event.get("maxResults", 50))
 
-    shard_key = resolve_shard_key(event)
-    db_path = download_shard(shard_key)
-    tsv = run_shard_search(query_fasta, db_path, max_results)
+    # Per-shard timing, captured with monotonic() and emitted as a sidecar in the
+    # `finally` below so it fires whether the search succeeds or throws (a failed
+    # shard still leaves a breadcrumb under fail-fast). `shardSeqs` is threaded
+    # from the manifest by the orchestrator/Map for the shard-count benchmark.
+    timings = {"shard_seq_count": event.get("shardSeqs")}
+    status = "success"
+    error = None
+    job_t0 = time.monotonic()
+    try:
+        shard_key = resolve_shard_key(event)
 
-    n_hits = tsv.count("\n") if tsv else 0
-    part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv"
-    s3.put_object(Bucket=S3_BUCKET, Key=part_key, Body=tsv.encode(),
-                  ContentType="text/tab-separated-values")
-    print(f"wrote {n_hits} hits -> s3://{S3_BUCKET}/{part_key}")
+        d0 = time.monotonic()
+        db_path = download_shard(shard_key)
+        timings["download_ms"] = round((time.monotonic() - d0) * 1000, 1)
+        local_path = db_path + ".dmnd"
+        if os.path.exists(local_path):
+            timings["shard_size_bytes"] = os.path.getsize(local_path)
 
-    return {
-        "sessionId": session_id,
-        "jobId": job_id,
-        "shardIndex": shard_index,
-        "partKey": part_key,
-        "numHits": n_hits,
-    }
+        s0 = time.monotonic()
+        tsv = run_shard_search(query_fasta, db_path, max_results)
+        timings["search_ms"] = round((time.monotonic() - s0) * 1000, 1)
+
+        n_hits = tsv.count("\n") if tsv else 0
+        timings["num_hits"] = n_hits
+        part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv"
+        s3.put_object(Bucket=S3_BUCKET, Key=part_key, Body=tsv.encode(),
+                      ContentType="text/tab-separated-values")
+        print(f"wrote {n_hits} hits -> s3://{S3_BUCKET}/{part_key}")
+
+        return {
+            "sessionId": session_id,
+            "jobId": job_id,
+            "shardIndex": shard_index,
+            "partKey": part_key,
+            "numHits": n_hits,
+        }
+    except Exception as e:
+        status = "failed"
+        error = str(e)
+        raise  # fail-fast: propagate so the Map branch fails the whole job
+    finally:
+        timings["total_ms"] = round((time.monotonic() - job_t0) * 1000, 1)
+        write_shard_timing(session_id, job_id, shard_index, timings, status, error)
 
 
 if __name__ == "__main__":

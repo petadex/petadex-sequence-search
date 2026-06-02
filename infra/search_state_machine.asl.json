@@ -12,6 +12,7 @@
         "maxResults.$": "$.maxResults",
         "shardIndex.$": "$$.Map.Item.Value.shardIndex",
         "shardKey.$": "$$.Map.Item.Value.shardKey",
+        "shardSeqs.$": "$$.Map.Item.Value.shardSeqs",
         "queryFasta.$": "States.Format('>query\n{}', $.querySequence)"
       },
       "ItemProcessor": {
@@ -40,7 +41,11 @@
       },
       "ResultPath": "$.workerResults",
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "Next": "JobFailed" }
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailureTiming"
+        }
       ],
       "Next": "Aggregate"
     },
@@ -61,9 +66,44 @@
         }
       ],
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "Next": "JobFailed" }
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailureTiming"
+        }
       ],
       "End": true
+    },
+    "RecordFailureTiming": {
+      "Comment": "Fail-fast path: the normal Aggregate never ran, so invoke the aggregator in timing-only mode to roll up whatever per-shard sidecars exist into a failed timing.json, then still fail the job. Preceded by a Catch with ResultPath $.error, so the top-level fields (sessionId/jobId/version/submittedAt/shards) survive for the Parameters below.",
+      "Type": "Task",
+      "Resource": "${AggregatorFunctionArn}",
+      "Parameters": {
+        "mode": "timing-only",
+        "sessionId.$": "$.sessionId",
+        "jobId.$": "$.jobId",
+        "version.$": "$.version",
+        "submittedAt.$": "$.submittedAt",
+        "shards.$": "$.shards"
+      },
+      "ResultPath": "$.timingResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "JobFailed" }
+      ],
+      "Next": "JobFailed"
     },
     "JobFailed": {
       "Type": "Fail",

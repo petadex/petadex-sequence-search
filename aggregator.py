@@ -31,6 +31,7 @@ per the plan. A real Logan-corpus metadata source is a separate, future concern.
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 import boto3
 
@@ -119,11 +120,115 @@ def read_parts(session_id, job_id):
     return results, n_parts
 
 
+def read_shard_metas(session_id, job_id):
+    """Read every per-shard timing sidecar (shard_*.meta.json) under parts/.
+
+    Tolerant by design: a sidecar that is missing or unparseable is skipped
+    here, not raised on — the rollup in `write_job_timing` decides per expected
+    shard whether to record it as `missing`. Returns {shard_index: meta_dict}.
+    """
+    prefix = f"results/{session_id}/{job_id}/parts/"
+    paginator = s3.get_paginator("list_objects_v2")
+    metas = {}
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if not obj["Key"].endswith(".meta.json"):
+                continue
+            try:
+                body = s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read()
+                meta = json.loads(body)
+                metas[int(meta["shard_index"])] = meta
+            except Exception as e:
+                print(f"WARN unreadable timing sidecar {obj['Key']}: {e}")
+    return metas
+
+
+def write_job_timing(session_id, job_id, version, shard_count,
+                     job_submitted_at, status):
+    """Roll the per-shard timing sidecars up into one job-level timing.json.
+
+    Written one level ABOVE parts/ (`results/{sessionId}/{jobId}/timing.json`)
+    and, on the success path, AFTER the result JSON so it stays off the
+    user-facing critical path. Like the worker sidecar, this logs and swallows
+    any error — timing telemetry must never fail (or, on the failure path,
+    re-fail) a job.
+
+    Two invocation sites:
+      - success: the normal Aggregate state, after the result is written.
+      - failure: the Step Functions failure state (timing-only mode), where the
+        normal Aggregate never ran. It rolls up whatever sidecars exist and
+        marks any absent shard `missing` rather than failing the rollup.
+    """
+    try:
+        metas = read_shard_metas(session_id, job_id)
+
+        shards = []
+        completed_total_ms = []
+        for i in range(shard_count):
+            m = metas.get(i)
+            if m is None:
+                # Worker died before writing a sidecar (or never ran) — record a
+                # breadcrumb-shaped placeholder instead of dropping the shard.
+                shards.append({"shard_index": i, "status": "missing"})
+                continue
+            shards.append(m)
+            if m.get("status") == "success" and m.get("total_ms") is not None:
+                completed_total_ms.append(m["total_ms"])
+
+        completed_at = datetime.now(timezone.utc)
+        total_wall_ms = None
+        if job_submitted_at:
+            try:
+                submitted = datetime.fromisoformat(job_submitted_at)
+                total_wall_ms = round(
+                    (completed_at - submitted).total_seconds() * 1000, 1)
+            except ValueError as e:
+                print(f"WARN bad submittedAt {job_submitted_at!r}: {e}")
+
+        slowest = max(completed_total_ms) if completed_total_ms else None
+        spread = (max(completed_total_ms) - min(completed_total_ms)
+                  if completed_total_ms else None)
+
+        doc = {
+            "job_id": job_id,
+            "session_id": session_id,
+            "version": version,
+            "status": status,
+            "submitted_at": job_submitted_at,
+            "completed_at": completed_at.isoformat(),
+            "total_wall_ms": total_wall_ms,
+            "shard_count": shard_count,
+            "shards_expected": shard_count,
+            "shards_completed": len(completed_total_ms),
+            "slowest_shard_ms": slowest,
+            "fastest_slowest_spread_ms": spread,
+            "shards": sorted(shards, key=lambda s: s["shard_index"]),
+        }
+        key = f"results/{session_id}/{job_id}/timing.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=key,
+                      Body=json.dumps(doc).encode(),
+                      ContentType="application/json")
+        print(f"wrote job timing ({status}, {len(completed_total_ms)}/{shard_count} "
+              f"shards) -> s3://{S3_BUCKET}/{key}")
+    except Exception as e:
+        print(f"WARN write_job_timing failed: {e}")
+
+
 def handler(event, context):
     print(f"Aggregator event: sessionId={event.get('sessionId')} "
           f"jobId={event.get('jobId')}")
     session_id = event["sessionId"]
     job_id = event["jobId"]
+
+    # Failure path (invoked from the Step Functions failure state): the normal
+    # Aggregate never ran, so there is no result to write — just roll up whatever
+    # per-shard sidecars exist and mark the job failed. No RDS round-trip.
+    if event.get("mode") == "timing-only":
+        shard_count = len(event["shards"]) if "shards" in event else 0
+        write_job_timing(session_id, job_id, event.get("version"), shard_count,
+                         event.get("submittedAt"), status="failed")
+        return {"sessionId": session_id, "jobId": job_id, "status": "failed"}
+
     query_header = event.get("queryHeader")
     query_sequence = event["querySequence"]
     max_results = int(event.get("maxResults", 50))
@@ -162,6 +267,12 @@ def handler(event, context):
     s3.put_object(Bucket=S3_BUCKET, Key=f"results/{session_id}.index",
                   Body=job_id, ContentType="text/plain")
     print(f"wrote {len(results)} results -> s3://{S3_BUCKET}/{result_key}")
+
+    # Roll the per-shard timing sidecars into job-level timing.json. AFTER the
+    # result write (off the critical path) and never raises — see write_job_timing.
+    shard_count = expected_parts if expected_parts is not None else n_parts
+    write_job_timing(session_id, job_id, event.get("version"), shard_count,
+                     event.get("submittedAt"), status="success")
 
     return {"sessionId": session_id, "jobId": job_id,
             "s3_key": result_key, "num_results": len(results)}
