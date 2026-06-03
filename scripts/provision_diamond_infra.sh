@@ -24,7 +24,12 @@
 #   IMAGE_URI       Full ECR image URI (default: <acct>.dkr.ecr.<region>.amazonaws.com/petadex-mmseq2-search:latest)
 #   VPC_SUBNET_IDS  Comma-separated subnet IDs for the aggregator (to reach RDS).
 #   VPC_SG_IDS      Comma-separated security group IDs for the aggregator.
-#   WORKER_RESERVED_CONCURRENCY  Default 20 (= SHARD_COUNT).
+#   WORKER_RESERVED_CONCURRENCY  Default 60 (= SHARD_COUNT × concurrent jobs).
+#       Each job's Map fans out SHARD_COUNT (20) workers at once, so this caps
+#       the number of *simultaneous* searches at RESERVED / 20. At 20 a single
+#       extra concurrent job (e.g. the deploy's 3-example regen) throttles every
+#       worker, and the Map's short throttle-retry then fail-fasts the whole job.
+#       60 = 3 concurrent jobs; raise by 20 per additional concurrent search.
 #
 # The aggregator reaches RDS exactly as the legacy function does. If that
 # function runs inside the VPC, set VPC_SUBNET_IDS/VPC_SG_IDS to the same values
@@ -36,7 +41,7 @@ ACCOUNT_ID="${ACCOUNT_ID:-797308887321}"
 REGION="${AWS_REGION:-us-east-1}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-petadex-mmseq2-search}"
 IMAGE_URI="${IMAGE_URI:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPOSITORY}:latest}"
-WORKER_RESERVED_CONCURRENCY="${WORKER_RESERVED_CONCURRENCY:-20}"
+WORKER_RESERVED_CONCURRENCY="${WORKER_RESERVED_CONCURRENCY:-60}"
 
 ORCH_FN="petadex-diamond-orchestrator"
 WORKER_FN="petadex-diamond-worker"
