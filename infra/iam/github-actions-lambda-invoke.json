@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeAndDescribeSearchFunctions",
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction", "lambda:GetFunctionConfiguration"],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:797308887321:function:petadex-mmseqs2-search",
+        "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-orchestrator",
+        "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-worker",
+        "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-aggregator"
+      ]
+    }
+  ]
+}

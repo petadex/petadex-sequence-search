@@ -42,6 +42,7 @@ ORCH_FN="petadex-diamond-orchestrator"
 WORKER_FN="petadex-diamond-worker"
 AGG_FN="petadex-diamond-aggregator"
 SM_NAME="petadex-diamond-search"
+GHA_ROLE="${GHA_ROLE:-petadex-github-actions-role}"  # pre-existing CI role
 SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SM_NAME}"
 
 : "${DB_SECRET_ARN:?set DB_SECRET_ARN to the RDS credentials secret ARN}"
@@ -81,6 +82,19 @@ ensure_role "${SM_NAME}-role"   "$IAM_DIR/statemachine-trust.json" statemachine-
 if [[ -n "${VPC_SUBNET_IDS:-}" ]]; then
   aws iam attach-role-policy --role-name "${AGG_FN}-role" \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole >/dev/null
+fi
+
+# Grant the pre-existing CI role permission to invoke the orchestrator (and
+# describe the worker/aggregator) so deploy.yml's example-regen + wait steps
+# work. We only update the inline policy; the role itself is owned elsewhere and
+# is never created here.
+if aws iam get-role --role-name "$GHA_ROLE" >/dev/null 2>&1; then
+  echo "  updating $GHA_ROLE inline policy petadex-lambda-invoke"
+  aws iam put-role-policy --role-name "$GHA_ROLE" \
+    --policy-name petadex-lambda-invoke \
+    --policy-document "file://$IAM_DIR/github-actions-lambda-invoke.json" >/dev/null
+else
+  echo "::warning:: CI role $GHA_ROLE not found — skipping lambda-invoke grant"
 fi
 
 ORCH_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ORCH_FN}-role"
