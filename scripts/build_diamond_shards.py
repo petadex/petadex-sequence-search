@@ -187,8 +187,31 @@ def build_shard(fasta_path, dmnd_base, threads):
     if not dmnd_path.exists():
         raise RuntimeError(f"expected {dmnd_path} after makedb, not found")
     size = dmnd_path.stat().st_size
-    print(f"    -> {dmnd_path.name}  {human(size)}  in {time.time() - t0:.0f}s")
-    return size
+    letters = shard_letters(dmnd_base)
+    print(f"    -> {dmnd_path.name}  {human(size)}  {letters:,} letters  "
+          f"in {time.time() - t0:.0f}s")
+    return size, letters
+
+
+def shard_letters(dmnd_base):
+    """Residue (letter) count of a built .dmnd, via `diamond dbinfo`.
+
+    Recorded in the manifest as total_letters and passed to workers as
+    --dbsize, so per-shard e-values calibrate against the full corpus instead
+    of a single shard (see docs/evalue-calibration.md). Returns 0 if it can't
+    be parsed — the build still proceeds; dbsize just won't be recorded.
+    """
+    try:
+        out = subprocess.run(["diamond", "dbinfo", "-d", str(dmnd_base)],
+                             capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            if "letters" in line.lower():
+                digits = "".join(ch for ch in line if ch.isdigit())
+                if digits:
+                    return int(digits)
+    except Exception as e:
+        print(f"    WARNING: diamond dbinfo failed for {dmnd_base}: {e}")
+    return 0
 
 
 def diamond_version():
@@ -293,10 +316,12 @@ def main():
     # [2/4] Build each .dmnd; delete the FASTA right after to bound scratch use.
     print(f"\n[2/4] Building {args.shard_count} DIAMOND databases...")
     dmnd_sizes = []
+    dmnd_letters = []
     for i in range(args.shard_count):
         print(f"shard_{i:0{width}d}:")
-        size = build_shard(fasta_paths[i], dmnd_bases[i], args.threads)
+        size, letters = build_shard(fasta_paths[i], dmnd_bases[i], args.threads)
         dmnd_sizes.append(size)
+        dmnd_letters.append(letters)
         if not args.keep_fasta:
             fasta_paths[i].unlink()
     print(f"  total .dmnd: {human(sum(dmnd_sizes))}")
@@ -323,12 +348,16 @@ def main():
         "total_sequences": total,
         "expected_sequences": CORPUS_COUNT,
         "total_dmnd_bytes": sum(dmnd_sizes),
+        # Total corpus residues — workers pass this as --dbsize so e-values
+        # calibrate against the whole corpus, not one shard (docs/evalue-calibration.md).
+        "total_letters": sum(dmnd_letters),
         "shards": [
             {
                 "index": i,
                 "key": f"{DIAMOND_PREFIX}/{version}/shard_{i:0{width}d}.dmnd",
                 "sequences": counts[i],
                 "dmnd_bytes": dmnd_sizes[i],
+                "letters": dmnd_letters[i],
             }
             for i in range(args.shard_count)
         ],

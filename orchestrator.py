@@ -90,6 +90,10 @@ def load_shards(version):
     db_meta = {
         "corpus": manifest.get("corpus"),
         "dbSequenceCount": manifest.get("total_sequences"),
+        # Total corpus residues for --dbsize e-value calibration. None until the
+        # manifest is (re)built or backfilled with total_letters; workers then
+        # omit --dbsize (legacy per-shard behavior). See docs/evalue-calibration.md.
+        "dbLetters": manifest.get("total_letters"),
     }
     return shards, db_meta
 
@@ -120,6 +124,10 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         # is self-identifying as Logan (300M) vs the legacy nr (1M) path.
         "corpus": db_meta.get("corpus"),
         "dbSequenceCount": db_meta.get("dbSequenceCount"),
+        # Effective DB size (residues) so each worker calibrates e-values against
+        # the full corpus, not its single shard. 0 ⇒ workers omit --dbsize
+        # (unchanged legacy behavior until the manifest carries total_letters).
+        "dbSize": db_meta.get("dbLetters") or 0,
     }
     # Name the execution after the job for traceability + idempotency (a retried
     # invoke with the same jobId collides instead of double-fanning-out).

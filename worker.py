@@ -57,6 +57,10 @@ SENSITIVITY = os.environ.get("DIAMOND_SENSITIVITY", "--very-sensitive")
 BLOCK_SIZE = os.environ.get("DIAMOND_BLOCK_SIZE", "1")   # -b; Check 5: 0.5–1
 # Lambda allocates ~1 vCPU per 1769 MB; os.cpu_count() reflects that.
 THREADS = int(os.environ.get("DIAMOND_THREADS", os.cpu_count() or 2))
+# Effective reference-DB size (residues) for e-value calibration. Normally
+# threaded from the manifest via the event (`dbSize`); this env is a manual
+# override fallback. See docs/evalue-calibration.md.
+DBSIZE_ENV = os.environ.get("DIAMOND_DBSIZE")
 
 # DIAMOND outfmt-6 columns, in the exact order the aggregator expects. Mirrors
 # the legacy MMseqs2 field order (target, qstart, qend, tstart, tend, alnlen,
@@ -132,7 +136,7 @@ def download_shard(shard_key):
     return db_path
 
 
-def run_shard_search(query_fasta, db_path, max_results):
+def run_shard_search(query_fasta, db_path, max_results, dbsize=None):
     """Run `diamond blastp` for this shard; return the raw outfmt-6 TSV text."""
     query_file = "/tmp/query.fasta"
     with open(query_file, "w") as f:
@@ -151,8 +155,20 @@ def run_shard_search(query_fasta, db_path, max_results):
         "-k", str(max_results),
         "--threads", str(THREADS),
         SENSITIVITY,
-        "--outfmt", *OUTFMT,
     ]
+    # Calibrate e-values against the FULL corpus, not this ~1/20 shard. Without
+    # --dbsize, DIAMOND uses the shard's own residue count, so e-values come out
+    # ~SHARD_COUNT× too significant (E ∝ database size). dbsize = total corpus
+    # residues (manifest.total_letters), threaded from the orchestrator. Bit
+    # scores are unaffected. See docs/evalue-calibration.md.
+    if dbsize:
+        try:
+            n = int(dbsize)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            cmd += ["--dbsize", str(n)]
+    cmd += ["--outfmt", *OUTFMT]
     print(f"$ {' '.join(cmd)}")
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -216,6 +232,9 @@ def handler(event, context):
     shard_index = int(event["shardIndex"])
     query_fasta = event["queryFasta"]
     max_results = int(event.get("maxResults", 50))
+    # Effective full-corpus DB size for e-value calibration (manifest-derived,
+    # threaded via the Map). 0/None ⇒ omit --dbsize (legacy per-shard behavior).
+    dbsize = event.get("dbSize") or DBSIZE_ENV
 
     # Per-shard timing, captured with monotonic() and emitted as a sidecar in the
     # `finally` below so it fires whether the search succeeds or throws (a failed
@@ -236,7 +255,7 @@ def handler(event, context):
             timings["shard_size_bytes"] = os.path.getsize(local_path)
 
         s0 = time.monotonic()
-        tsv = run_shard_search(query_fasta, db_path, max_results)
+        tsv = run_shard_search(query_fasta, db_path, max_results, dbsize=dbsize)
         timings["search_ms"] = round((time.monotonic() - s0) * 1000, 1)
 
         n_hits = tsv.count("\n") if tsv else 0

@@ -221,3 +221,6 @@ scripts/.env
 # Lambda smoke-test artifacts
 out.json
 job_id:*
+
+# Documentation
+/docs/*

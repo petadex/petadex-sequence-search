@@ -13,6 +13,7 @@
         "shardIndex.$": "$$.Map.Item.Value.shardIndex",
         "shardKey.$": "$$.Map.Item.Value.shardKey",
         "shardSeqs.$": "$$.Map.Item.Value.shardSeqs",
+        "dbSize.$": "$.dbSize",
         "queryFasta.$": "States.Format('>query\n{}', $.querySequence)"
       },
       "ItemProcessor": {
