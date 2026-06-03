@@ -144,7 +144,7 @@ def read_shard_metas(session_id, job_id):
 
 
 def write_job_timing(session_id, job_id, version, shard_count,
-                     job_submitted_at, status):
+                     job_submitted_at, status, aggregator_timing=None):
     """Roll the per-shard timing sidecars up into one job-level timing.json.
 
     Written one level ABOVE parts/ (`results/{sessionId}/{jobId}/timing.json`)
@@ -152,6 +152,12 @@ def write_job_timing(session_id, job_id, version, shard_count,
     user-facing critical path. Like the worker sidecar, this logs and swallows
     any error — timing telemetry must never fail (or, on the failure path,
     re-fail) a job.
+
+    `aggregator_timing` (success path only): a dict of the aggregator's own
+    post-Map phase durations in ms — `read_parts_ms`, `sort_ms`, `metadata_ms`,
+    `write_result_ms`, `total_ms`. This is what isolates how much of a job's
+    tail is metadata enrichment vs. part-merge vs. ranking. Absent (None) on the
+    timing-only failure path, where no aggregation ran.
 
     Two invocation sites:
       - success: the normal Aggregate state, after the result is written.
@@ -202,6 +208,7 @@ def write_job_timing(session_id, job_id, version, shard_count,
             "shards_completed": len(completed_total_ms),
             "slowest_shard_ms": slowest,
             "fastest_slowest_spread_ms": spread,
+            "aggregator": aggregator_timing,
             "shards": sorted(shards, key=lambda s: s["shard_index"]),
         }
         key = f"results/{session_id}/{job_id}/timing.json"
@@ -235,23 +242,36 @@ def handler(event, context):
     # Optional cross-check: number of shards we expected to report a part.
     expected_parts = len(event["shards"]) if "shards" in event else None
 
-    t0 = time.time()
+    # Phase timing: isolates how much of the post-Map tail is part-merge vs.
+    # ranking vs. metadata enrichment vs. the result write. Surfaced in
+    # timing.json under `aggregator` (never-raise — see write_job_timing).
+    phase_ms = {}
+
+    t0 = time.monotonic()
     results, n_parts = read_parts(session_id, job_id)
-    print(f"read {len(results)} hits from {n_parts} parts in {time.time()-t0:.2f}s")
+    phase_ms["read_parts_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    print(f"read {len(results)} hits from {n_parts} parts in "
+          f"{phase_ms['read_parts_ms']:.0f}ms")
     if expected_parts is not None and n_parts != expected_parts:
         # Fail-fast should make this impossible; loudly flag if it ever happens.
         raise RuntimeError(f"expected {expected_parts} parts, found {n_parts}")
 
     # Global rank: bitscore desc, tiebreak evalue asc; then top-K. Targets are
     # unique across shards (corpus is partitioned), so no dedup is needed.
+    t0 = time.monotonic()
     results.sort(key=lambda r: (-r["bitscore"], r["evalue"]))
     results = results[:max_results]
+    phase_ms["sort_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
-    # Enrich once from RDS (see METADATA CAVEAT).
+    # Enrich once from RDS (see METADATA CAVEAT). Timed so we can see exactly how
+    # much of the tail this round-trip costs — including a slow/failed RDS
+    # connect, which would otherwise be invisible.
+    t0 = time.monotonic()
     accession_ids = {r["target_id"] for r in results}
     metadata = fetch_metadata(accession_ids)
     for r in results:
         r["metadata"] = metadata.get(r["target_id"])
+    phase_ms["metadata_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
     result_doc = {
         "query_header": query_header,
@@ -269,19 +289,24 @@ def handler(event, context):
         "db_sequence_count": event.get("dbSequenceCount"),
         "results": results,
     }
+    t0 = time.monotonic()
     result_key = f"results/{session_id}/{job_id}.json"
     s3.put_object(Bucket=S3_BUCKET, Key=result_key,
                   Body=json.dumps(result_doc), ContentType="application/json")
     # Index pointer the web app polls (sessionId -> latest jobId), unchanged.
     s3.put_object(Bucket=S3_BUCKET, Key=f"results/{session_id}.index",
                   Body=job_id, ContentType="text/plain")
+    phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
     print(f"wrote {len(results)} results -> s3://{S3_BUCKET}/{result_key}")
+
+    phase_ms["total_ms"] = round(sum(phase_ms.values()), 1)
 
     # Roll the per-shard timing sidecars into job-level timing.json. AFTER the
     # result write (off the critical path) and never raises — see write_job_timing.
     shard_count = expected_parts if expected_parts is not None else n_parts
     write_job_timing(session_id, job_id, event.get("version"), shard_count,
-                     event.get("submittedAt"), status="success")
+                     event.get("submittedAt"), status="success",
+                     aggregator_timing=phase_ms)
 
     return {"sessionId": session_id, "jobId": job_id,
             "s3_key": result_key, "num_results": len(results)}

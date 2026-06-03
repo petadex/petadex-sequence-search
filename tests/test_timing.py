@@ -179,6 +179,32 @@ def test_aggregator_stamps_database_identity():
     assert doc["num_results"] == 1 and "results" in doc
 
 
+def test_aggregator_records_phase_timing():
+    """Success path: timing.json carries an `aggregator` block with the
+    post-Map phase durations, so we can see how much of the tail is metadata
+    enrichment vs. part-merge vs. ranking vs. the write."""
+    fake = FakeS3()
+    aggregator.s3 = fake
+    aggregator.fetch_metadata = lambda ids: {}  # no RDS
+    fake.store["results/sess/job/parts/shard_0.tsv"] = (
+        b"target1\t1\t10\t1\t10\t10\t55.5\t1e-50\t200\n")
+    _seed_sidecar(fake, "job", 0)
+
+    event = {
+        "sessionId": "sess", "jobId": "job", "version": "v1",
+        "querySequence": "MKLLIVL", "queryHeader": ">q", "maxResults": 50,
+        "shards": [{"shardIndex": 0}],
+    }
+    aggregator.handler(event, None)
+
+    doc = json.loads(fake.store["results/sess/job/timing.json"])
+    agg = doc["aggregator"]
+    assert agg is not None
+    for k in ("read_parts_ms", "sort_ms", "metadata_ms",
+              "write_result_ms", "total_ms"):
+        assert k in agg and agg[k] >= 0.0
+
+
 def test_aggregator_timing_only_mode():
     """timing-only invocation writes a failed rollup and no result JSON."""
     fake = FakeS3()
