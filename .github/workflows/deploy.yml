@@ -127,11 +127,17 @@ jobs:
       - name: Regenerate example searches
         run: |
           python3 - <<'EOF'
-          import boto3, json, re
+          import boto3, json, re, sys, time
 
           lambda_client = boto3.client('lambda', region_name='us-east-1')
           s3 = boto3.client('s3', region_name='us-east-1')
           BUCKET = 'petadex'
+          ORCHESTRATOR = 'petadex-diamond-orchestrator'
+          # The orchestrator returns a job_id immediately; the DIAMOND fan-out
+          # writes the result ~500s later (cold, 20 shards). Poll, don't block on
+          # invoke. 14 min covers a cold run with margin.
+          POLL_TIMEOUT_S = 840
+          POLL_INTERVAL_S = 15
 
           # Parse example-sequences.txt
           examples = []
@@ -149,33 +155,95 @@ jobs:
               if current_header:
                   examples.append((current_header, '\n'.join(current_seq)))
 
+          # Phase 1: fan out one orchestrator invocation per example. Each starts
+          # an independent Step Functions execution, so all run concurrently.
+          jobs = []
           for name, sequence in examples:
               slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
               example_key = f'example_{slug}'
               session_id = f'regen_{example_key}'
               fasta = f'>{name}\n{sequence}'
-
-              print(f'Invoking Lambda for {example_key}...')
+              print(f'Invoking orchestrator for {example_key}...')
               resp = lambda_client.invoke(
-                  FunctionName='petadex-mmseqs2-search',
-                  Payload=json.dumps({'sessionId': session_id, 'sequence': fasta, 'max_results': 50}),
-                  InvocationType='RequestResponse'
+                  FunctionName=ORCHESTRATOR,
+                  Payload=json.dumps({
+                      'action': 'search',
+                      'sessionId': session_id,
+                      'sequence': fasta,
+                      'max_results': 50,
+                  }),
+                  InvocationType='RequestResponse',
               )
-              body = json.loads(json.loads(resp['Payload'].read())['body'])
+              payload = json.loads(resp['Payload'].read())
+              if resp.get('FunctionError') or payload.get('statusCode') != 200:
+                  print(f'::warning::{example_key}: orchestrator invoke failed: {payload}')
+                  continue
+              body = json.loads(payload['body'])
               job_id = body['job_id']
+              jobs.append({
+                  'example_key': example_key,
+                  'result_key': f'results/{session_id}/{job_id}.json',
+                  'timing_key': f'results/{session_id}/{job_id}/timing.json',
+              })
+              print(f'  started job {job_id}')
 
-              # Delete old example file if it exists
+          # Phase 2: poll all jobs together until each result lands, the job
+          # fails fast (timing.json status=failed), or the global deadline passes.
+          def exists(key):
               try:
-                  s3.delete_object(Bucket=BUCKET, Key=f'results/{example_key}.json')
-                  print(f'  Deleted old results/{example_key}.json')
+                  s3.head_object(Bucket=BUCKET, Key=key)
+                  return True
               except Exception:
-                  pass
+                  return False
 
-              # Copy new result to example key
+          def failed(job):
+              try:
+                  t = json.loads(s3.get_object(Bucket=BUCKET, Key=job['timing_key'])['Body'].read())
+                  return t.get('status') == 'failed'
+              except Exception:
+                  return False
+
+          pending = {j['example_key']: j for j in jobs}
+          done, failures = [], []
+          deadline = time.time() + POLL_TIMEOUT_S
+          while pending and time.time() < deadline:
+              for key in list(pending):
+                  job = pending[key]
+                  if exists(job['result_key']):
+                      done.append(pending.pop(key))
+                      print(f'  ✓ {key} result ready')
+                  elif failed(job):
+                      failures.append(pending.pop(key))
+                      print(f'::warning::{key}: job failed (fail-fast) — keeping old example')
+              if pending:
+                  time.sleep(POLL_INTERVAL_S)
+
+          for key in pending:
+              print(f'::error::{key}: timed out after {POLL_TIMEOUT_S}s')
+
+          # Always wipe every existing example result first: each deploy fully
+          # regenerates from scratch, so no stale example can ever survive.
+          existing = s3.list_objects_v2(Bucket=BUCKET, Prefix='results/example_')
+          for obj in existing.get('Contents', []):
+              s3.delete_object(Bucket=BUCKET, Key=obj['Key'])
+              print(f"  deleted {obj['Key']}")
+
+          # Phase 3: publish the examples that completed.
+          for job in done:
+              ek = job['example_key']
               s3.copy_object(
                   Bucket=BUCKET,
-                  CopySource={'Bucket': BUCKET, 'Key': f'results/{session_id}/{job_id}.json'},
-                  Key=f'results/{example_key}.json'
+                  CopySource={'Bucket': BUCKET, 'Key': job['result_key']},
+                  Key=f'results/{ek}.json',
               )
-              print(f'  ✓ Updated results/{example_key}.json')
+              print(f'  ✓ Updated results/{ek}.json')
+
+          print(f'\nRegen summary: {len(done)} updated, {len(failures)} failed, '
+                f'{len(pending)} timed out (of {len(examples)} examples).')
+
+          # Hard fail: every example must regenerate successfully, or the deploy
+          # fails (and the wiped examples stay gone until a clean run succeeds).
+          if len(done) != len(examples):
+              print('::error::example regeneration incomplete — failing the deploy.')
+              sys.exit(1)
           EOF

@@ -217,3 +217,7 @@ scripts/.env
 # Database build artifacts
 /tmp/enzyme_fastaa_*
 /tmp/*_mmseqs_*
+
+# Lambda smoke-test artifacts
+out.json
+job_id:*
