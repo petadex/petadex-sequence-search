@@ -39,6 +39,7 @@ column is already a percentage in [0,100]. The legacy MMseqs2 code multiplies
 worker emits the raw column untouched; the assertion lives in the merger.
 """
 
+import glob
 import json
 import os
 import subprocess
@@ -106,6 +107,18 @@ def download_shard(shard_key):
     basename = os.path.basename(shard_key)                # shard_00.dmnd
     local_path = f"/tmp/{basename}"
     db_path = local_path[:-len(".dmnd")]                  # /tmp/shard_00
+
+    # A shard .dmnd is ~6 GB and /tmp is 10 GB, so only ONE fits at a time.
+    # Warm-container routing is NOT shard-affine — Lambda may hand this warm
+    # container a different shard than its last invocation — so a naive
+    # "cache across warm invocations" leaves the previous 6 GB shard on disk
+    # and the next download overflows /tmp with [Errno 28] No space left on
+    # device. Evict every other cached shard before proceeding; the wanted
+    # shard (if present) is kept, so same-shard reuse is still a cache hit.
+    for other in glob.glob("/tmp/shard_*.dmnd"):
+        if other != local_path:
+            print(f"evicting stale cached shard: {other}")
+            os.remove(other)
 
     if os.path.exists(local_path):
         print(f"shard cached: {local_path}")
