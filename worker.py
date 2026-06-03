@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 
 import boto3
 from boto3.s3.transfer import TransferConfig
+from botocore.config import Config as BotoConfig
 
 S3_BUCKET = "petadex"
 
@@ -64,13 +65,21 @@ OUTFMT = ["6", "sseqid", "qstart", "qend", "sstart", "send",
           "length", "pident", "evalue", "bitscore"]
 
 # Mirror the multipart tuning the legacy download path uses.
+S3_DOWNLOAD_CONCURRENCY = 32
 S3_TRANSFER_CONFIG = TransferConfig(
     multipart_chunksize=32 * 1024 * 1024,
-    max_concurrency=32,
+    max_concurrency=S3_DOWNLOAD_CONCURRENCY,
     use_threads=True,
 )
 
-s3 = boto3.client("s3", region_name="us-east-1")
+# The connection pool must be >= the transfer's max_concurrency, otherwise the
+# surplus download threads thrash a too-small pool ("Connection pool is full,
+# discarding connection") and throughput collapses (~74 MB/s seen vs ~356 MB/s).
+s3 = boto3.client(
+    "s3",
+    region_name="us-east-1",
+    config=BotoConfig(max_pool_connections=S3_DOWNLOAD_CONCURRENCY),
+)
 
 
 def resolve_shard_key(event):
