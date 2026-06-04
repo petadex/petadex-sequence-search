@@ -142,14 +142,17 @@ echo "[2/4] Lambda functions (one image, three handlers)"
 ensure_function "$ORCH_FN" "$ORCH_ROLE_ARN" orchestrator.handler 512 30 512 \
   "Variables={S3_BUCKET=petadex,STATE_MACHINE_ARN=$SM_ARN}"
 
-# Memory 10240 (Lambda max ≈ 6 vCPU): DIAMOND --very-sensitive is CPU-bound and
-# uses THREADS=os.cpu_count(), so vCPU count — not RSS — sets search wall time.
+# Memory 10240 (Lambda max ≈ 6 vCPU): DIAMOND search is CPU-bound and uses
+# THREADS=os.cpu_count(), so vCPU count — not RSS — sets search wall time.
 # The Phase-0 ~2 GB figure was an RSS estimate; at 2 GB (~1 vCPU) a shard search
-# runs ~7+ min. At 10240 a shard runs ~3.5 min (~210s) + ~80s download, leaving
-# real headroom under the 600s timeout. Timeout 600 (not the planned 300): even
-# at 5308 MB a shard took ~492s, so 300 would time out every shard.
+# runs ~7+ min. At 10240 a shard runs much faster + ~80s download, leaving real
+# headroom under the 600s timeout. Timeout 600 (not the planned 300): even at
+# 5308 MB a --very-sensitive shard took ~492s, so 300 would time out every shard.
+# DIAMOND_SENSITIVITY=default → no flag → DIAMOND default (fast) mode; empty or
+# "default"/"none" all omit the flag (worker.py). Set to --very-sensitive etc.
+# to raise recall (slower).
 ensure_function "$WORKER_FN" "$WORKER_ROLE_ARN" worker.handler 10240 600 10240 \
-  "Variables={S3_BUCKET=petadex,DIAMOND_SENSITIVITY=--very-sensitive,DIAMOND_BLOCK_SIZE=1}"
+  "Variables={S3_BUCKET=petadex,DIAMOND_SENSITIVITY=default,DIAMOND_BLOCK_SIZE=1}"
 echo "  reserved concurrency = $WORKER_RESERVED_CONCURRENCY"
 aws lambda put-function-concurrency --function-name "$WORKER_FN" \
   --reserved-concurrent-executions "$WORKER_RESERVED_CONCURRENCY" >/dev/null

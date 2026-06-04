@@ -52,8 +52,10 @@ from botocore.config import Config as BotoConfig
 
 S3_BUCKET = "petadex"
 
-# Locked Phase 0 parameters (see CLAUDE.md settled-parameter table).
-SENSITIVITY = os.environ.get("DIAMOND_SENSITIVITY", "--very-sensitive")
+# Phase 0 parameters (see CLAUDE.md settled-parameter table). An empty value or
+# "default"/"none" omits the sensitivity flag entirely → DIAMOND's default (fast)
+# mode, which is distinct from (and slower than) --fast.
+SENSITIVITY = os.environ.get("DIAMOND_SENSITIVITY", "--very-sensitive").strip()
 BLOCK_SIZE = os.environ.get("DIAMOND_BLOCK_SIZE", "1")   # -b; Check 5: 0.5–1
 # Lambda allocates ~1 vCPU per 1769 MB; os.cpu_count() reflects that.
 THREADS = int(os.environ.get("DIAMOND_THREADS", os.cpu_count() or 2))
@@ -154,8 +156,10 @@ def run_shard_search(query_fasta, db_path, max_results, dbsize=None):
         "-b", str(BLOCK_SIZE),
         "-k", str(max_results),
         "--threads", str(THREADS),
-        SENSITIVITY,
     ]
+    # Omit the flag for an empty/"default"/"none" value → DIAMOND default mode.
+    if SENSITIVITY and SENSITIVITY.lower() not in ("default", "none"):
+        cmd.append(SENSITIVITY)
     # Calibrate e-values against the FULL corpus, not this ~1/20 shard. Without
     # --dbsize, DIAMOND uses the shard's own residue count, so e-values come out
     # ~SHARD_COUNT× too significant (E ∝ database size). dbsize = total corpus

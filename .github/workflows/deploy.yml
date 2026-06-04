@@ -155,6 +155,23 @@ jobs:
               if current_header:
                   examples.append((current_header, '\n'.join(current_seq)))
 
+          # Phase 0: wipe previous regen working dirs so they don't accumulate.
+          # Each deploy mints a fresh jobId under results/regen_example_*/ (result
+          # JSON + 20 parts + timing), and old jobs are otherwise never cleaned —
+          # they pile up one set per deploy. The published examples live at
+          # results/example_*.json (rewritten below), so this prefix is fully
+          # disposable; clearing it keeps each session at a single live job.
+          paginator = s3.get_paginator('list_objects_v2')
+          stale = [o['Key']
+                   for page in paginator.paginate(Bucket=BUCKET, Prefix='results/regen_example_')
+                   for o in page.get('Contents', [])]
+          for i in range(0, len(stale), 1000):
+              s3.delete_objects(
+                  Bucket=BUCKET,
+                  Delete={'Objects': [{'Key': k} for k in stale[i:i + 1000]]})
+          if stale:
+              print(f'  wiped {len(stale)} stale regen objects from previous deploys')
+
           # Phase 1: fan out one orchestrator invocation per example. Each starts
           # an independent Step Functions execution, so all run concurrently.
           jobs = []
