@@ -1,0 +1,74 @@
+# PETadex sequence-search — DIAMOND scale-out data flow
+# Render:  d2 --theme 200 --sketch infra/architecture.d2 docs/architecture.svg
+# (theme 200 = "Dark Mauve"; --sketch gives the hand-drawn, non-generic look)
+
+direction: down
+
+wa: "🌐 PETadex web app" {
+  shape: oval
+}
+
+orch: "⚙️ Orchestrator Lambda" {
+  o1: "validate + parse FASTA once"
+  o2: "read diamond/LATEST → version"
+  o3: "read manifest.json → shard list"
+  o4: "mint jobId · StartExecution"
+  o1 -> o2 -> o3 -> o4
+}
+
+s3db: "🗄️ S3 · diamond/{version}/\n20 × shard_NN.dmnd + manifest" {
+  shape: cylinder
+}
+
+sfn: "🔀 Step Functions · Map — 20 workers per search\n(reserved concurrency 100 ⇒ ≤ 5 searches at once)" {
+  direction: right
+  w0: "Worker\nshard 0"
+  w1: "Worker\nshard 1"
+  wdots: "…" { shape: text }
+  w19: "Worker\nshard 19"
+}
+
+parts: "🗄️ S3 · results/{sid}/{jid}/parts/\nshard_N.tsv + shard_N.meta.json" {
+  shape: cylinder
+}
+
+agg: "🧬 Aggregator Lambda · final Map state" {
+  a1: "merge parts · assert 0 ≤ pident ≤ 100"
+  a2: "sort bitscore↓ / evalue↑ · top-K"
+  a3: "fetch_metadata (once)"
+  a4: "write result + index + timing"
+  a1 -> a2 -> a3 -> a4
+}
+
+rds: "🛢️ RDS\nblast_nr_metadata" {
+  shape: cylinder
+}
+
+result: "🗄️ S3 · results/{sid}/{jid}.json\n+ results/{sid}.index + timing.json" {
+  shape: cylinder
+}
+
+wa -> orch: "{ action, sessionId, sequence, max_results }"
+orch -> wa: "returns { job_id, s3_key } immediately" {
+  style.stroke-dash: 4
+}
+orch.o2 <-> s3db: read
+orch.o3 <-> s3db: read
+orch.o4 -> sfn
+s3db -> sfn: "download shard → /tmp (evict prior)"
+sfn -> parts: "diamond blastp (default)"
+parts -> agg
+rds <-> agg.a3: enrich
+agg -> result
+wa -> result: "poll .index → fetch result JSON" {
+  style.stroke-dash: 4
+}
+
+# --- styling: warm amber for Lambdas, slate/blue for stores ---
+orch.style: { fill: "#3b2f12"; stroke: "#f59e0b" }
+sfn.style: { fill: "#3b2f12"; stroke: "#f59e0b" }
+agg.style: { fill: "#3b2f12"; stroke: "#f59e0b" }
+s3db.style: { fill: "#1f2937"; stroke: "#60a5fa" }
+parts.style: { fill: "#1f2937"; stroke: "#60a5fa" }
+result.style: { fill: "#1f2937"; stroke: "#60a5fa" }
+rds.style: { fill: "#1f2937"; stroke: "#60a5fa" }

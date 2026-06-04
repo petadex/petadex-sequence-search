@@ -21,13 +21,13 @@ This single-container path searches the ~1M-sequence `petadex-nr` subset and is 
 
 The scale-out architecture replaces the single MMseqs2 Lambda with a **sharded, fan-out DIAMOND search** over the full Logan-scale protein corpus (**307,155,746 sequences**). The database is split into 20 shards, each searched in parallel by its own worker Lambda, with all shards resident on **S3** (not EFS). The web-app contract (event shape, result JSON, S3 keys) is preserved, so the cutover is a function-name swap on the caller's side.
 
-> **Status:** the DIAMOND infra is deployed and the full 307M sharded DB is built and published (`diamond/LATEST`), but the web app has not yet been cut over — it still calls the legacy MMseqs2 function. See "Cutover" below.
+> **Status:** live. The DIAMOND infra is deployed, the full 307M sharded DB is built and published (`diamond/LATEST`), and the web app was cut over to `petadex-diamond-orchestrator` (2026-06-03) — **users now search the Logan corpus, not nr.** The legacy MMseqs2 function remains deployed but no longer serves the web app (removal pending Phase 7).
 
 ### Why these choices
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Engine | **DIAMOND2** (`blastp --very-sensitive`) | The Logan corpus was built with DIAMOND2 — methodological consistency. More compact DB format; streams better at scale. Parity with MMseqs2 validated (top-10 90–100% overlap, near-identical identities). |
+| Engine | **DIAMOND2** (`blastp`, default sensitivity) | The Logan corpus was built with DIAMOND2 — methodological consistency. More compact DB format; streams better at scale. Parity with MMseqs2 validated at `--very-sensitive` (top-10 90–100% overlap, near-identical identities); the live search now runs default mode (recall-for-speed trade, 2026-06-04). |
 | Storage | **S3, sharded** (not EFS) | At low query volume EFS costs ~$60/mo flat; the ~120 GB sharded DB on S3 is ~$2.80/mo. Per-cold-start shard download (~78s) is acceptable at BLAST-timescale latency. |
 | Compute | **Lambda fan-out** | No idle cost; scales to N shards in parallel. |
 | Coordination | **Step Functions Map** | Declarative per-shard retry/catch; a failed branch aborts the whole job (fail-fast). |
@@ -47,51 +47,11 @@ All four share **one Docker image** (ARM64, DIAMOND built from source — no arm
 
 ### Data flow
 
-```mermaid
-flowchart TD
-    WA["🌐 PETadex web app"]
+![DIAMOND scale-out data flow](infra/architecture.svg)
 
-    subgraph ORCH["⚙️ Orchestrator Lambda"]
-        direction TB
-        O1["validate + parse FASTA once"] --> O2["read diamond/LATEST → version"] --> O3["read manifest.json → shard list"] --> O4["mint jobId · StartExecution"]
-    end
+<!-- Diagram source: infra/architecture.d2 (D2). Regenerate with:
+     d2 --theme 200 --sketch infra/architecture.d2 infra/architecture.svg -->
 
-    S3DB[("🗄️ S3 · diamond/{version}/<br/>20 × shard_NN.dmnd + manifest")]
-
-    subgraph SFN["🔀 Step Functions · Map (MaxConcurrency = 20)"]
-        direction LR
-        W0["Worker<br/>shard 0"]
-        W1["Worker<br/>shard 1"]
-        WDOTS["…"]
-        W19["Worker<br/>shard 19"]
-    end
-
-    PARTS[("🗄️ S3 · results/{sid}/{jid}/parts/<br/>shard_N.tsv + shard_N.meta.json")]
-
-    subgraph AGG["🧬 Aggregator Lambda · final Map state"]
-        direction TB
-        A1["merge parts · assert 0≤pident≤100"] --> A2["sort bitscore↓ / evalue↑ · top-K"] --> A3["fetch_metadata (once)"] --> A4["write result + index + timing"]
-    end
-
-    RDS[("🛢️ RDS<br/>blast_nr_metadata")]
-    RESULT[("🗄️ S3 · results/{sid}/{jid}.json<br/>+ results/{sid}.index + timing.json")]
-
-    WA -- "{ action, sessionId, sequence, max_results }" --> ORCH
-    ORCH -. "returns { job_id, s3_key } immediately" .-> WA
-    O2 <-->|read| S3DB
-    O3 <-->|read| S3DB
-    O4 --> SFN
-    S3DB -- "download shard → /tmp (evict prior)" --> SFN
-    SFN -- "diamond blastp --very-sensitive" --> PARTS
-    PARTS --> AGG
-    RDS <-->|enrich| A3
-    AGG --> RESULT
-    WA -. "poll .index → fetch result JSON" .-> RESULT
-
-    classDef store fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
-    classDef lambda fill:#3b2f12,stroke:#f59e0b,color:#fde68a;
-    class S3DB,PARTS,RESULT,RDS store;
-```
 
 > **Fail-fast:** each Map branch retries transient `Lambda.*` errors; if any shard still fails, the whole execution fails (`Catch: States.ALL`) — no result JSON or `.index` is written, so the poller simply never sees a completion.
 
@@ -116,7 +76,7 @@ sequenceDiagram
     par fan-out — all 20 shards in parallel (~5 min)
         SF->>W: invoke worker(shard N)
         W->>S3: download shard_N.dmnd → /tmp
-        W->>W: diamond blastp --very-sensitive
+        W->>W: diamond blastp (default sensitivity)
         W->>S3: write parts/shard_N.tsv + meta
     end
 
@@ -151,13 +111,13 @@ s3://petadex/diamond/
 | Corpus size | 307,155,746 sequences | full Logan catalytic-ORF corpus |
 | Total `.dmnd` | ~112 GiB / 120 GB | 20 shards, ~5.6 GiB each |
 | `SHARD_COUNT` | **20** | bounded by `/tmp` (a shard must fit in 10 GB with headroom) |
-| Worker memory | **10240 MB** (Lambda max, ≈6 vCPU) | DIAMOND `--very-sensitive` is CPU-bound; vCPU count sets search wall time |
+| Worker memory | **10240 MB** (Lambda max, ≈6 vCPU) | DIAMOND search is CPU-bound; vCPU count sets search wall time |
 | Worker `/tmp` | **10240 MB** | holds one ~6 GB shard + query + output |
-| Worker timeout | **600 s** | ~78 s download + ~190 s search ≈ ~290 s/shard, with headroom |
-| Worker reserved concurrency | **100** | must exceed peak burst (3 concurrent jobs × 20 = 60), not equal it |
-| Sensitivity | **`--very-sensitive`** | strictly dominates `--sensitive` (faster *and* higher recall); low-memory streaming path |
+| Worker timeout | **600 s** | ~78 s download + search ≈ ~290 s/shard at `--very-sensitive`, with headroom; default mode is faster, so the headroom only grows |
+| Worker reserved concurrency | **100** | 20 workers per search ⇒ caps at ~5 concurrent searches; must exceed peak burst (3 jobs × 20 = 60), not equal it |
+| Sensitivity | **default** (no flag) | recall-for-speed trade chosen 2026-06-04 over the Phase-0 `--very-sensitive` lock (~34 s vs ~170 s per shard). Env `DIAMOND_SENSITIVITY` overrides (empty/`default`/`none` ⇒ no flag). Re-validate parity if distant homologs matter. |
 | `-b` (block size) | **1** | bounds RAM, not disk |
-| Per-shard timing | download ~78 s, search ~190 s, total ~290 s | job wall ~5 min |
+| Per-shard timing | download ~78 s, search ~190 s, total ~290 s (measured at `--very-sensitive`) | job wall ~5 min; default mode reduces search time |
 
 ### Result S3 layout & contract
 
@@ -187,9 +147,9 @@ Each worker writes a standalone `shard_N.meta.json` sidecar (download/search ms,
 
 If any shard fails after the Step Functions per-branch retries, the **whole job fails** — no partial results, no `incomplete` flag, schema unchanged. A failed job writes a `timing.json` with `status: "failed"` and per-shard `error` fields, but **no result JSON / `.index`** — so a poller sees the search simply never complete (the caller should apply its own timeout).
 
-### Cutover
+### Cutover (done — 2026-06-03)
 
-To move the web app from nr → Logan: point its search invocation from `petadex-mmseqs2-search` to **`petadex-diamond-orchestrator`** and grant its role `lambda:InvokeFunction` on the orchestrator. Because the contract is preserved, no result-parsing changes are needed; latency rises from ~58 s to ~5 min, so the caller should add a poll timeout / failure state.
+The web app's search invocation was repointed from `petadex-mmseqs2-search` to **`petadex-diamond-orchestrator`** (its role granted `lambda:InvokeFunction` on the orchestrator). Because the contract is preserved, no result-parsing changes were needed; latency rose from ~58 s to ~5 min, so the caller applies a poll timeout / failure state. Remaining cleanup (remove MMseqs2 from the image / `mmseqs2/` prefix) is tracked under Phase 7.
 
 ---
 
@@ -336,7 +296,7 @@ This extracts sequences from the `enzyme_fastaa` table, builds a new timestamped
 
 ## Tech Stack
 
-- **Search**: DIAMOND2 `blastp --very-sensitive` (scale-out, current target) · MMseqs2 `easy-search` (legacy single-Lambda, still live)
+- **Search**: DIAMOND2 `blastp` (scale-out, now serving the web app) · MMseqs2 `easy-search` (legacy single-Lambda, deployed but no longer serving; removal pending Phase 7)
 - **Runtime**: Python 3.11 on AWS Lambda ARM64 (Graviton)
 - **Coordination**: AWS Step Functions (`Map` fan-out) across orchestrator / worker / aggregator Lambdas
 - **Storage**: Amazon S3 (`petadex` bucket) — sharded `.dmnd` database + results
