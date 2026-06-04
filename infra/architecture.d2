@@ -1,68 +1,75 @@
 # PETadex sequence-search — DIAMOND scale-out data flow
-# Render:  d2 --theme 200 --sketch infra/architecture.d2 docs/architecture.svg
+# Render:  d2 --theme 200 --sketch infra/architecture.d2 infra/architecture.svg
 # (theme 200 = "Dark Mauve"; --sketch gives the hand-drawn, non-generic look)
+#
+# Layout notes: hierarchical (dagre) top-down flow so edges route AROUND boxes
+# (a grid fold is squarer but routes lines straight through boxes / overlaps labels).
+# Each Lambda's internal steps are collapsed into a bulleted label rather than
+# separate nodes, which keeps the diagram compact and avoids crossing edges; the
+# worker row is widened so the diagram reads landscape-ish rather than a tall column.
 
 direction: down
 
-wa: "🌐 PETadex web app" {
-  shape: oval
+# Legend (native d2 legend — rendered in its own box, excluded from layout).
+# Mirrors the styling below: amber = compute, blue = stores; solid = sync flow,
+# dashed = async return / poll.
+vars: {
+  d2-legend: {
+    compute: "Compute — Lambda / Step Functions" {
+      style: { fill: "#3b2f12"; stroke: "#f59e0b"; text-transform: none }
+    }
+    store: "Storage — S3 / RDS" {
+      shape: cylinder
+      style: { fill: "#1f2937"; stroke: "#60a5fa"; text-transform: none }
+    }
+    # Endpoints carry empty labels so only the line + its annotation render
+    # (a connection must have two nodes; these just anchor the sample line).
+    sync_a: ""
+    sync_b: ""
+    async_a: ""
+    async_b: ""
+    sync_a -> sync_b: "synchronous data flow"
+    async_a -> async_b: "async return / web-app poll" { style.stroke-dash: 4 }
+  }
 }
 
-orch: "⚙️ Orchestrator Lambda" {
-  o1: "validate + parse FASTA once"
-  o2: "read diamond/LATEST → version"
-  o3: "read manifest.json → shard list"
-  o4: "mint jobId · StartExecution"
-  o1 -> o2 -> o3 -> o4
+wa: "🌐 PETadex web app" { shape: oval }
+
+orch: "⚙️ Orchestrator Lambda\n\n• validate + parse FASTA once\n• read diamond/LATEST → version\n• read manifest.json → shard list\n• mint jobId · StartExecution" {
+  style.text-transform: none
 }
 
-s3db: "🗄️ S3 · diamond/{version}/\n20 × shard_NN.dmnd + manifest" {
-  shape: cylinder
-}
+s3db: "🗄️ S3 · diamond/{version}/\n20 × shard_NN.dmnd + manifest" { shape: cylinder }
 
-sfn: "🔀 Step Functions · Map — 20 workers per search\n(reserved concurrency 100 ⇒ ≤ 5 searches at once)" {
+sfn: "🔀 Step Functions · Map — 20 workers / search\n(reserved concurrency 100 ⇒ ≤ 5 searches at once)" {
   direction: right
   w0: "Worker\nshard 0"
   w1: "Worker\nshard 1"
+  w2: "Worker\nshard 2"
   wdots: "…" { shape: text }
+  w18: "Worker\nshard 18"
   w19: "Worker\nshard 19"
 }
 
-parts: "🗄️ S3 · results/{sid}/{jid}/parts/\nshard_N.tsv + shard_N.meta.json" {
-  shape: cylinder
+parts: "🗄️ S3 · results/{sid}/{jid}/parts/\nshard_N.tsv + shard_N.meta.json" { shape: cylinder }
+
+agg: "🧬 Aggregator Lambda · final Map state\n\n• merge parts · assert 0 ≤ pident ≤ 100\n• sort bitscore↓ / evalue↑ · top-K\n• fetch_metadata (once)\n• write result + index + timing" {
+  style.text-transform: none
 }
 
-agg: "🧬 Aggregator Lambda · final Map state" {
-  a1: "merge parts · assert 0 ≤ pident ≤ 100"
-  a2: "sort bitscore↓ / evalue↑ · top-K"
-  a3: "fetch_metadata (once)"
-  a4: "write result + index + timing"
-  a1 -> a2 -> a3 -> a4
-}
-
-rds: "🛢️ RDS\nblast_nr_metadata" {
-  shape: cylinder
-}
-
-result: "🗄️ S3 · results/{sid}/{jid}.json\n+ results/{sid}.index + timing.json" {
-  shape: cylinder
-}
+rds: "🛢️ RDS · blast_nr_metadata" { shape: cylinder }
+result: "🗄️ S3 · results/{sid}/{jid}.json\n+ results/{sid}.index + timing.json" { shape: cylinder }
 
 wa -> orch: "{ action, sessionId, sequence, max_results }"
-orch -> wa: "returns { job_id, s3_key } immediately" {
-  style.stroke-dash: 4
-}
-orch.o2 <-> s3db: read
-orch.o3 <-> s3db: read
-orch.o4 -> sfn
+orch -> wa: "{ job_id, s3_key } immediately" { style.stroke-dash: 4 }
+orch <-> s3db: "read LATEST + manifest"
+orch -> sfn: "StartExecution"
 s3db -> sfn: "download shard → /tmp (evict prior)"
 sfn -> parts: "diamond blastp (default)"
 parts -> agg
-rds <-> agg.a3: enrich
+agg <-> rds: enrich
 agg -> result
-wa -> result: "poll .index → fetch result JSON" {
-  style.stroke-dash: 4
-}
+wa -> result: "poll .index → fetch result JSON" { style.stroke-dash: 4 }
 
 # --- styling: warm amber for Lambdas, slate/blue for stores ---
 orch.style: { fill: "#3b2f12"; stroke: "#f59e0b" }

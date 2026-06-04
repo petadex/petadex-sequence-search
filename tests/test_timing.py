@@ -220,3 +220,48 @@ def test_aggregator_timing_only_mode():
     # No user-facing result/index written on the failure path.
     assert "results/sess/job.json" not in fake.store
     assert "results/sess.index" not in fake.store
+
+
+_ORCH_TIMING = {
+    "parse_ms": 1.2, "resolve_version_ms": 30.5,
+    "load_shards_ms": 12.0, "total_pre_start_ms": 43.7,
+}
+
+
+def test_aggregator_records_orchestrator_timing_success():
+    """Success path: the orchestrator's pre-start phases threaded through the
+    execution input land in timing.json under `orchestrator`, symmetric to the
+    `aggregator` block — so the wall's orchestrator contribution is visible."""
+    fake = FakeS3()
+    aggregator.s3 = fake
+    aggregator.fetch_metadata = lambda ids: {}  # no RDS
+    fake.store["results/sess/job/parts/shard_0.tsv"] = (
+        b"target1\t1\t10\t1\t10\t10\t55.5\t1e-50\t200\n")
+    _seed_sidecar(fake, "job", 0)
+
+    event = {
+        "sessionId": "sess", "jobId": "job", "version": "v1",
+        "querySequence": "MKLLIVL", "queryHeader": ">q", "maxResults": 50,
+        "shards": [{"shardIndex": 0}],
+        "orchestratorTiming": _ORCH_TIMING,
+    }
+    aggregator.handler(event, None)
+
+    doc = json.loads(fake.store["results/sess/job/timing.json"])
+    assert doc["orchestrator"] == _ORCH_TIMING
+
+
+def test_aggregator_records_orchestrator_timing_failure():
+    """Fail-fast path: orchestratorTiming survives the timing-only invocation
+    (the ASL Parameters forward it), so failed jobs still record it."""
+    fake = FakeS3()
+    aggregator.s3 = fake
+    _seed_sidecar(fake, "job", 0)
+    event = {"mode": "timing-only", "sessionId": "sess", "jobId": "job",
+             "version": "v1", "submittedAt": "2026-06-02T00:00:00+00:00",
+             "shards": [{"shardIndex": 0}],
+             "orchestratorTiming": _ORCH_TIMING}
+    aggregator.handler(event, None)
+
+    doc = json.loads(fake.store["results/sess/job/timing.json"])
+    assert doc["orchestrator"] == _ORCH_TIMING

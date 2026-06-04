@@ -99,13 +99,17 @@ def load_shards(version):
 
 
 def start_search(session_id, job_id, version, query_header, query_sequence,
-                 max_results, shards, db_meta):
+                 max_results, shards, db_meta, orch_timing=None):
     """Start the Step Functions Map execution. Returns immediately (async).
 
     The execution input carries `querySequence`/`queryHeader` (not a prebuilt
     FASTA): the Map's ItemSelector formats each worker's `queryFasta` from
     `querySequence`, while the aggregator uses `queryHeader`/`querySequence` to
     write the unchanged result-JSON shape.
+
+    `orch_timing` (optional): the orchestrator's own pre-start phase durations
+    (parse/resolve/load), passed through untouched (the ASL preserves top-level
+    fields) so the aggregator can fold them into timing.json.
     """
     if not STATE_MACHINE_ARN:
         raise RuntimeError("STATE_MACHINE_ARN is not configured")
@@ -116,6 +120,8 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         # Job start stamp, threaded through so the aggregator can compute
         # total_wall_ms (it has no other way to know when the job began).
         "submittedAt": datetime.now(timezone.utc).isoformat(),
+        # Orchestrator self-timing, recorded by the aggregator in timing.json.
+        "orchestratorTiming": orch_timing or {},
         "queryHeader": query_header,
         "querySequence": query_sequence,
         "maxResults": max_results,
@@ -195,18 +201,38 @@ def handler(event, context):
         raw_input = body.get("sequence", "").strip()
         max_results = int(body.get("max_results", 50))
 
+        # Measure the orchestrator's own phases and thread them into the execution
+        # input so the aggregator records them in timing.json (symmetric to its
+        # own `aggregator` block). All work below is pre-start_execution, so the
+        # numbers are known before the payload is sent; the start_execution API
+        # call's own latency can't be self-included (it stays in CloudWatch).
+        orch_t0 = time.monotonic()
+
         # Validate ONCE here; workers receive the cleaned query and never re-check.
         query_header, query_sequence = parse_fasta(raw_input)
         query_sequence = validate_sequence(query_sequence)
+        parse_ms = round((time.monotonic() - orch_t0) * 1000, 1)
 
         # Pin the version once, read the shard list, fan out via Step Functions.
+        t1 = time.monotonic()
         version = resolve_version(body.get("version"))
+        resolve_version_ms = round((time.monotonic() - t1) * 1000, 1)
+
+        t1 = time.monotonic()
         shards, db_meta = load_shards(version)
+        load_shards_ms = round((time.monotonic() - t1) * 1000, 1)
+
         job_id = str(uuid.uuid4())
+        orch_timing = {
+            "parse_ms": parse_ms,
+            "resolve_version_ms": resolve_version_ms,
+            "load_shards_ms": load_shards_ms,
+            "total_pre_start_ms": round((time.monotonic() - orch_t0) * 1000, 1),
+        }
 
         t0 = time.time()
         start_search(session_id, job_id, version, query_header, query_sequence,
-                     max_results, shards, db_meta)
+                     max_results, shards, db_meta, orch_timing)
         print(f"TIMING start_execution: {time.time() - t0:.2f}s "
               f"(version={version}, shards={len(shards)}, jobId={job_id})")
 

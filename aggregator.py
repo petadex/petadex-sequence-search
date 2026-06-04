@@ -144,7 +144,8 @@ def read_shard_metas(session_id, job_id):
 
 
 def write_job_timing(session_id, job_id, version, shard_count,
-                     job_submitted_at, status, aggregator_timing=None):
+                     job_submitted_at, status, aggregator_timing=None,
+                     orchestrator_timing=None):
     """Roll the per-shard timing sidecars up into one job-level timing.json.
 
     Written one level ABOVE parts/ (`results/{sessionId}/{jobId}/timing.json`)
@@ -158,6 +159,12 @@ def write_job_timing(session_id, job_id, version, shard_count,
     `write_result_ms`, `total_ms`. This is what isolates how much of a job's
     tail is metadata enrichment vs. part-merge vs. ranking. Absent (None) on the
     timing-only failure path, where no aggregation ran.
+
+    `orchestrator_timing` (both paths): the orchestrator's own pre-start phase
+    durations in ms — `parse_ms`, `resolve_version_ms`, `load_shards_ms`,
+    `total_pre_start_ms` — threaded through the execution input. This isolates
+    the orchestrator's contribution to job latency, which `total_wall_ms`
+    otherwise hides (the wall starts at `submittedAt`, stamped after this work).
 
     Two invocation sites:
       - success: the normal Aggregate state, after the result is written.
@@ -208,6 +215,7 @@ def write_job_timing(session_id, job_id, version, shard_count,
             "shards_completed": len(completed_total_ms),
             "slowest_shard_ms": slowest,
             "fastest_slowest_spread_ms": spread,
+            "orchestrator": orchestrator_timing,
             "aggregator": aggregator_timing,
             "shards": sorted(shards, key=lambda s: s["shard_index"]),
         }
@@ -233,7 +241,8 @@ def handler(event, context):
     if event.get("mode") == "timing-only":
         shard_count = len(event["shards"]) if "shards" in event else 0
         write_job_timing(session_id, job_id, event.get("version"), shard_count,
-                         event.get("submittedAt"), status="failed")
+                         event.get("submittedAt"), status="failed",
+                         orchestrator_timing=event.get("orchestratorTiming"))
         return {"sessionId": session_id, "jobId": job_id, "status": "failed"}
 
     query_header = event.get("queryHeader")
@@ -306,7 +315,8 @@ def handler(event, context):
     shard_count = expected_parts if expected_parts is not None else n_parts
     write_job_timing(session_id, job_id, event.get("version"), shard_count,
                      event.get("submittedAt"), status="success",
-                     aggregator_timing=phase_ms)
+                     aggregator_timing=phase_ms,
+                     orchestrator_timing=event.get("orchestratorTiming"))
 
     return {"sessionId": session_id, "jobId": job_id,
             "s3_key": result_key, "num_results": len(results)}

@@ -85,6 +85,7 @@
         "jobId.$": "$.jobId",
         "version.$": "$.version",
         "submittedAt.$": "$.submittedAt",
+        "orchestratorTiming.$": "$.orchestratorTiming",
         "shards.$": "$.shards"
       },
       "ResultPath": "$.timingResult",
