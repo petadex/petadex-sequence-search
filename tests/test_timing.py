@@ -166,6 +166,7 @@ def test_aggregator_stamps_database_identity():
         "querySequence": "MKLLIVL", "queryHeader": ">q", "maxResults": 50,
         "corpus": "s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa",
         "dbSequenceCount": 307155746,
+        "databaseRelease": "v1.1", "searchVersion": "1.0.0",
         "shards": [{"shardIndex": 0}],
     }
     aggregator.handler(event, None)
@@ -174,6 +175,9 @@ def test_aggregator_stamps_database_identity():
     assert doc["engine"] == "diamond"
     assert doc["database"] == "s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa"
     assert doc["database_version"] == "catalytic_orfs_v1.1_x"
+    # Two version axes both labelled: semantic release + search-pipeline semver.
+    assert doc["database_release"] == "v1.1"
+    assert doc["search_version"] == "1.0.0"
     assert doc["db_sequence_count"] == 307155746
     # The contract fields are still present and unchanged.
     assert doc["num_results"] == 1 and "results" in doc

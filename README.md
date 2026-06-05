@@ -147,9 +147,38 @@ results/{sessionId}/{jobId}/parts/shard_N.meta.json# per-shard timing sidecar
 results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 ```
 
-The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
+The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
 
 Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
+
+### Versioning & cache invalidation
+
+Every search is labelled by **two independent version axes**, both stamped into the result JSON, so a cached result is never silently served against a corpus or a search pipeline it wasn't produced with:
+
+| Axis | Result field(s) | What it tracks | Changes when |
+|---|---|---|---|
+| **Database** | `database_release` (`v1.1`, human label) + `database_version` (`catalytic_orfs_v1.1_20260602_222538`, precise build tag) | The corpus searched against. `database_release` is parsed from the corpus filename (`petadex.catalytic_orfs.v1.1.fa`) and labels every shard via the manifest; `database_version` pins the exact build. | The corpus is rebuilt/republished (new data, re-sharding) — `database_version` changes on *every* rebuild; `database_release` only on a semantic bump (`v1.1` → `v1.2`). |
+| **Search** | `search_version` (`1.0.0`, semver) | The search pipeline — engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus — e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, or a scoring change. |
+
+Both axes are needed because either one alone leaves a staleness hole: a corpus bump invalidates results the database axis catches, but a pipeline change (same corpus, different sensitivity) is invisible to it — that's what `search_version` covers.
+
+**Cache key (web-app responsibility).** The Express app derives `sessionId` by hashing the query; today that is **`hash(sequence)` only**, which does *not* incorporate either version — so after a corpus or pipeline change the app would serve a stale cached result. The correct key is:
+
+```
+sessionId = sha256(sequence + "|" + database_version + "|" + search_version)
+```
+
+Use `database_version` (the precise build tag), not `database_release`, so the cache also invalidates on a same-release rebuild.
+
+The key must encode the versions a *fresh* search **would** run with (current corpus + pipeline), so the web app needs to learn them *before* the cache-hit decision — not read them off a stale entry. `database_version` is `diamond/LATEST`, but `search_version` is a code constant (`SEARCH_VERSION` in [common.py](common.py)) that lives nowhere in S3. So the orchestrator exposes a stateless **`version` action** as the single source of truth:
+
+```jsonc
+// request:  { "action": "version" }   (no sessionId — it's what you call to BUILD one)
+// response: { "database_version": "catalytic_orfs_v1.1_20260602_222538",
+//             "database_release": "v1.1", "search_version": "1.0.0" }
+```
+
+The web app calls this (cache the response briefly), folds the two versions into `makeSessionId`, then does its normal index lookup. **The `makeSessionId` change lives in the Express web-app repo (`petadex.io`), not here** — this repo's job is to make the versions *self-describing* (stamped into every result) and *queryable* (the `version` action) so the key can be built. Re-keying orphans every existing cache entry (a one-time full miss); pair it with an S3 lifecycle rule on `results/` to reap them.
 
 #### Result JSON schema (`results/{sessionId}/{jobId}.json`)
 
@@ -163,8 +192,10 @@ Two JSON objects are written per job: the **search result** (`{jobId}.json`) and
 | `num_results` | int | Number of hits returned (equals `len(results)`). |
 | `engine` | string | Search engine — always `diamond` on this path. |
 | `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
-| `database_version` | string | Versioned build tag of the corpus (e.g. `catalytic_orfs_v1.1_20260602_222538`). Pins the result to a specific corpus build. |
-| `db_sequence_count` | int | **Sequence** count across all shards (307,155,746). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is the residue count (see Scoring & e-values). |
+| `database_release` | string \| null | **Human-facing corpus version**, e.g. `v1.1` (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
+| `database_version` | string | **Precise build tag** of the corpus (e.g. `catalytic_orfs_v1.1_20260602_222538`). Pins the result to one exact build of a release — changes on *every* rebuild, even within the same `database_release`. This is the corpus identifier the cache key should use. |
+| `search_version` | string | **Search-pipeline version** (semver, e.g. `1.0.0`) — independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
+| `db_sequence_count` | int | **Sequence** count across all shards (307,155,746). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is a **residue** count (~105B residues ≈ 341.65 × 307,155,746 sequences; see Scoring & e-values). |
 | `results` | array | Hit list, ranked by bit-score descending, then e-value ascending. |
 
 **Per-hit object (each element of `results`):**
@@ -256,6 +287,8 @@ A shard whose worker died before writing its sidecar appears as `{ "shard_index"
 `percent_identity` (0–100), `bitscore`, and the alignment coordinates are taken straight from DIAMOND. Results are ranked by **bitscore** (tiebreak: e-value), which is correct across shards because a bit score depends only on the scoring system, not database size.
 
 **E-values, however, scale with database size** — so a shard searched in isolation would report e-values calibrated against only ~1/20 of the corpus (≈20× too significant). To fix this, every worker is given `--dbsize <total corpus residues>` (the manifest's `total_letters`, threaded orchestrator → worker), so e-values are calibrated against the **full corpus** and match a single full-database search. Bit scores are unaffected. (Engineering detail in `docs/evalue-calibration.md`; if a manifest lacks `total_letters`, workers omit `--dbsize` and fall back to per-shard e-values.)
+
+> **`--dbsize` is a residue count, not a sequence count — these are *not* expected to match.** DIAMOND's `--dbsize` is the number of *letters* (amino-acid residues) in the reference, used for Karlin-Altschul statistics. The live value is `--dbsize 104940484545` (~105 billion residues), whereas `db_sequence_count` is `307,155,746` (the number of *sequences*). They reconcile exactly: 104,940,484,545 ÷ 307,155,746 ≈ **341.65 residues per sequence** — a normal mean protein length. Seeing ~105B beside ~307M is therefore correct, not a bug. (The 105B figure for the current build is a striped-sample estimate, tagged `total_letters_source: striped-sample-estimate` in the manifest.)
 
 ### Telemetry
 

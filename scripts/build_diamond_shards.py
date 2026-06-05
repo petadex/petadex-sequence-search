@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -214,6 +215,18 @@ def shard_letters(dmnd_base):
     return 0
 
 
+def database_release(corpus_key):
+    """Semantic corpus release (e.g. "v1.1") parsed from the corpus filename.
+
+    s3://.../petadex.catalytic_orfs.v1.1.fa -> "v1.1". This is the human-facing
+    DATABASE version (distinct from the timestamped build `version` tag), stamped
+    into the manifest so the orchestrator/result can label searches by it without
+    re-parsing. Returns None if no vN[.N...] token is present.
+    """
+    m = re.search(r"v\d+(?:\.\d+)*", corpus_key or "")
+    return m.group(0) if m else None
+
+
 def diamond_version():
     try:
         out = subprocess.run(["diamond", "version"], capture_output=True,
@@ -340,6 +353,10 @@ def main():
     # [4/4] Manifest, then (last) LATEST.
     manifest = {
         "version": version,
+        # Semantic corpus release (e.g. "v1.1") — the human-facing DATABASE
+        # version, parsed from the corpus filename. Distinct from `version`, the
+        # timestamped build tag that pins an exact build of that release.
+        "database_release": database_release(args.key),
         "build_date": datetime.now(timezone.utc).isoformat(),
         "corpus": f"s3://{args.bucket}/{args.key}",
         "diamond_version": diamond_version(),

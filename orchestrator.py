@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-from common import parse_fasta, validate_sequence
+from common import SEARCH_VERSION, parse_database_release, parse_fasta, validate_sequence
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 DIAMOND_PREFIX = "diamond"
@@ -94,6 +94,13 @@ def load_shards(version):
         # manifest is (re)built or backfilled with total_letters; workers then
         # omit --dbsize (legacy per-shard behavior). See docs/evalue-calibration.md.
         "dbLetters": manifest.get("total_letters"),
+        # Semantic corpus release (e.g. "v1.1"), used to LABEL the search. Prefer
+        # the manifest's explicit field; fall back to parsing the corpus path so
+        # a manifest built before that field existed still resolves a clean
+        # release without a rebuild. NOTE this is the human-facing release, not
+        # the precise build tag (`version`) — the cache key should use `version`.
+        "databaseRelease": (manifest.get("database_release")
+                            or parse_database_release(manifest.get("corpus"))),
     }
     return shards, db_meta
 
@@ -130,6 +137,12 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         # is self-identifying as Logan (300M) vs the legacy nr (1M) path.
         "corpus": db_meta.get("corpus"),
         "dbSequenceCount": db_meta.get("dbSequenceCount"),
+        # Version labels stamped into the result + used by the web app's cache
+        # key: `databaseRelease` (v1.1, human-facing) and `searchVersion` (the
+        # search-pipeline semver). `version` (the precise build tag) is already
+        # in the payload above. See README "Versioning & cache invalidation".
+        "databaseRelease": db_meta.get("databaseRelease"),
+        "searchVersion": SEARCH_VERSION,
         # Effective DB size (residues) so each worker calibrates e-values against
         # the full corpus, not its single shard. 0 ⇒ workers omit --dbsize
         # (unchanged legacy behavior until the manifest carries total_letters).
@@ -142,6 +155,29 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
         name=f"{session_id}-{job_id}"[:80],
         input=json.dumps(payload),
     )
+
+
+def get_versions(requested=None):
+    """Resolve the version identifiers a FRESH search would run with.
+
+    Single source of truth for the web app's cache key: it needs
+    `database_version` + `search_version` to compute its sessionId, but
+    `search_version` is a code constant (not in S3) and `database_version` is
+    `diamond/LATEST` — so the app can't self-serve both. This stateless action
+    returns them (read it before reusing a cached sessionId; see the README
+    "Versioning & cache invalidation" section).
+
+    Cheap: one `LATEST` GET + one `manifest.json` GET (the app should cache the
+    response briefly rather than calling per request). `requested` pins a version
+    for testing, mirroring `resolve_version`.
+    """
+    version = resolve_version(requested)
+    _, db_meta = load_shards(version)
+    return {
+        "database_version": version,                       # precise build tag
+        "database_release": db_meta.get("databaseRelease"),  # human label (v1.1)
+        "search_version": SEARCH_VERSION,                  # search-pipeline semver
+    }
 
 
 def get_history(session_id):
@@ -190,6 +226,14 @@ def handler(event, context):
 
         body = json.loads(event["body"]) if isinstance(event.get("body"), str) else event
         action = body.get("action", "search")
+
+        # Stateless version lookup — deliberately BEFORE the sessionId check: the
+        # web app calls this to learn database_version + search_version so it can
+        # BUILD a version-aware cache-key sessionId, so requiring one here would
+        # be circular. See get_versions / README "Versioning & cache invalidation".
+        if action == "version":
+            return _resp(200, get_versions(body.get("version")))
+
         session_id = body.get("sessionId")
         if not session_id:
             raise ValueError("sessionId is required")

@@ -294,7 +294,15 @@ def handler(event, context):
         # the matching fields on the legacy side.
         "engine": "diamond",
         "database": event.get("corpus"),
+        # Two version axes label every search (see README "Versioning & cache
+        # invalidation"): `database_release` is the human-facing corpus version
+        # (v1.1); `database_version` is the precise timestamped build tag that
+        # pins the exact build. `search_version` is the search-pipeline semver
+        # (bumps on engine/sensitivity/scoring changes). The web app's cache key
+        # should fold in `database_version` + `search_version`.
+        "database_release": event.get("databaseRelease"),
         "database_version": event.get("version"),
+        "search_version": event.get("searchVersion"),
         "db_sequence_count": event.get("dbSequenceCount"),
         "results": results,
     }

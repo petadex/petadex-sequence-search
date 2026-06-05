@@ -255,7 +255,14 @@ def run_search(query_sequence, db_path, session_id, max_results=50, query_header
                 # version prefix; db_sequence_count is unknown here (nr subset).
                 "engine": "mmseqs2",
                 "database": f"{PREFIX}{DB_VERSION}",
+                # Version labels (parallel to aggregator.py) so a result is
+                # self-identifying and the web app's cache key reads the same
+                # fields on both paths. The nr DB tag carries no semantic vN
+                # release, so `database_release` is null here; `search_version`
+                # is a fixed legacy marker (this path is retired at Phase 7).
+                "database_release": None,
                 "database_version": DB_VERSION,
+                "search_version": "legacy-mmseqs2",
                 "db_sequence_count": None,
                 "results": results,
             }
