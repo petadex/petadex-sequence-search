@@ -133,6 +133,108 @@ results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 
 The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
 
+Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
+
+#### Result JSON schema (`results/{sessionId}/{jobId}.json`)
+
+**Top-level (job metadata):**
+
+| Field | Type | Description |
+|---|---|---|
+| `query_header` | string | User-supplied label identifying the search (free text; defaults to `query`). |
+| `query_sequence` | string | The input amino-acid sequence that was searched. |
+| `query_length` | int | Length of the query in residues. |
+| `num_results` | int | Number of hits returned (equals `len(results)`). |
+| `engine` | string | Search engine — always `diamond` on this path. |
+| `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
+| `database_version` | string | Versioned build tag of the corpus (e.g. `catalytic_orfs_v1.1_20260602_222538`). Pins the result to a specific corpus build. |
+| `db_sequence_count` | int | **Sequence** count across all shards (307,155,746). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is the residue count (see Scoring & e-values). |
+| `results` | array | Hit list, ranked by bit-score descending, then e-value ascending. |
+
+**Per-hit object (each element of `results`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `target_id` | string | Identifier of the matched DB sequence — Logan's native FASTA header, passed through unchanged. Pipe-delimited; see format below. |
+| `query_start` | int | Alignment start on the query (1-based, inclusive). |
+| `query_end` | int | Alignment end on the query (1-based, inclusive). |
+| `target_start` | int | Alignment start on the target (1-based, inclusive). |
+| `target_end` | int | Alignment end on the target (1-based, inclusive). |
+| `alignment_length` | int | Length of the aligned region in residues. |
+| `percent_identity` | float | Percent identical residues over the alignment, **0–100** (DIAMOND's native scale; never re-scaled — see Scoring & e-values). |
+| `evalue` | float | Expectation value, calibrated against the **full corpus** (not the local shard) via `--dbsize`. |
+| `bitscore` | float | DIAMOND bit-score. **Primary ranking key.** |
+| `metadata` | object \| null | RDS-enriched annotation; `null` when the target has no RDS match (the usual case for Logan ORF IDs — see below). |
+
+Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both query and target.
+
+**`target_id` format.** The build script (`scripts/build_diamond_shards.py`) keeps each record's **native corpus header** verbatim as the sequence ID — it does *not* synthesize or define this convention, which originates upstream in the Logan catalytic-ORF corpus. Observed IDs are pipe-delimited with **7 fields**, falling into two provenance types:
+
+| Field | Reference/structural hit | Logan metagenomic hit |
+|---|---|---|
+| | `1\|WP_054022242.1\|\|\|\|\|` · `4065673\|6EQD_A\|\|\|\|\|` | `610376058\|\|SRR15056541\|5882\|0\|933\|3` |
+| 1 | numeric ID (always present) | numeric ID (always present) |
+| 2 | reference accession — GenBank protein (`WP_054022242.1`) or PDB (`6EQD_A`) | *(empty)* |
+| 3 | *(empty)* | SRA run accession (`SRR…`/`ERR…`) |
+| 4–7 | *(empty)* | numeric metagenomic coordinates (contig/ORF locus, start, end, frame/strand) |
+
+> ⚠️ Fields 4–7 are **not authoritatively defined in this repo** — the build script is a passthrough, so their exact meaning must be confirmed against the upstream Logan corpus specification before relying on them. Consumers should treat the whole `target_id` as an opaque key and split it only for display.
+
+**`metadata` when populated.** Enrichment joins `blast_nr_metadata` on `genbank_accession_id`. Logan ORF IDs are not GenBank accessions, so they don't match and `metadata` is `null` for essentially all Logan hits (this is expected, not a failure). When a target *does* match (e.g. a reference/nr accession), `metadata` is an object with: `genbank_accession_id`, `organism`, `protein_id`, `definition`, `taxonomy`, `journal`, `collection_date`, `country` (all strings, individually nullable).
+
+#### Timing diagnostic schema (`results/{sessionId}/{jobId}/timing.json`)
+
+A side-car rollup written **beside** the result (not inside it), so it survives the fail-fast path and needs no contract change.
+
+**Top-level:**
+
+| Field | Type | Description |
+|---|---|---|
+| `job_id` | string (uuid) | Unique search job identifier. |
+| `session_id` | string | Session/run label (e.g. `regen_example_fast_petase`). |
+| `version` | string | Corpus build version (matches `database_version`). |
+| `status` | string | `success` or `failed`. |
+| `submitted_at` | string (ISO 8601) | Job submission timestamp (start of the wall clock). |
+| `completed_at` | string (ISO 8601) | Rollup-write timestamp. |
+| `total_wall_ms` | float \| null | End-to-end wall time from `submitted_at`, in ms. |
+| `shard_count` | int | Number of shards the corpus is split into (20). |
+| `shards_expected` | int | Shards the job expected to report. |
+| `shards_completed` | int | Shards that completed successfully. Equality with `shards_expected` is the fail-fast completeness check. |
+| `slowest_shard_ms` | float \| null | Max per-shard `total_ms` (≈ `total_wall_ms`). |
+| `fastest_slowest_spread_ms` | float \| null | Spread between fastest and slowest shard — the load-balance metric. |
+| `orchestrator` | object \| null | Orchestrator pre-start phase timings (`parse_ms`, `resolve_version_ms`, `load_shards_ms`, `total_pre_start_ms`). |
+| `aggregator` | object \| null | Aggregator post-Map phase timings (below); `null` on the failure path. |
+| `shards` | array | Per-shard timing records, sorted by `shard_index`. |
+
+**`aggregator` object:**
+
+| Field | Type | Description |
+|---|---|---|
+| `read_parts_ms` | float | Time reading + parsing all shard parts from S3. |
+| `sort_ms` | float | Time for the global bitscore/evalue ranking + top-K. |
+| `metadata_ms` | float | Time for the RDS metadata enrichment round-trip. |
+| `write_result_ms` | float | Time writing the combined result + `.index` to S3. |
+| `total_ms` | float | Sum of the aggregator phases. |
+
+**Per-shard object (each element of `shards`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `shard_index` | int | Shard identifier (0–19). |
+| `download_ms` | float | Time to download the shard `.dmnd` to `/tmp`. |
+| `search_ms` | float | Time for `diamond blastp` on this shard. |
+| `total_ms` | float | Download + search for this shard. |
+| `shard_size_bytes` | int | Size of the shard `.dmnd` (~6.0 GB / ~5.6 GiB each). |
+| `shard_seq_count` | int | Sequences in this shard (~15.36M each). |
+| `num_hits` | int | Hits this shard contributed before the global merge. |
+| `status` | string | Per-shard status (`success` / `failed` / `missing`). |
+| `error` | string \| null | Error message if the shard failed; `null` on success. |
+| `timestamp` | string (ISO 8601) | Shard completion time. |
+
+A shard whose worker died before writing its sidecar appears as `{ "shard_index": i, "status": "missing" }` rather than being dropped.
+
+**Notes from observed data.** Shards are near-perfectly even — every shard holds 15,357,787–15,357,788 sequences and ~6.017 GB, confirming the round-robin partition balances both seq count and residues (20 × ~15.357M = the 307,155,746 corpus total). Per-shard `download_ms` is uniform (~77–78 s, the Lambda network ceiling), so the `fastest_slowest_spread_ms` comes entirely from `search_ms`, which clusters into two bands (~29 s and ~37–38 s). The bimodality is not explained by sequence count (identical across shards) and is attributed to **Lambda vCPU allocation variance** (cold-vs-warm CPU) — a known, benign source of the ~9–10 s spread.
+
 ### Scoring & e-values
 
 `percent_identity` (0–100), `bitscore`, and the alignment coordinates are taken straight from DIAMOND. Results are ranked by **bitscore** (tiebreak: e-value), which is correct across shards because a bit score depends only on the scoring system, not database size.
