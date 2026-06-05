@@ -220,9 +220,14 @@ def write_job_timing(session_id, job_id, version, shard_count,
             "shards": sorted(shards, key=lambda s: s["shard_index"]),
         }
         key = f"results/{session_id}/{job_id}/timing.json"
+        # reapable=true: diagnostic sidecar, never re-read by the web app; expired
+        # by the tag-scoped lifecycle rule. The result {jobId}.json + .index below
+        # stay UNtagged so the rule can never reap a live result.
+        # Requires s3:PutObjectTagging in the aggregator IAM.
         s3.put_object(Bucket=S3_BUCKET, Key=key,
                       Body=json.dumps(doc).encode(),
-                      ContentType="application/json")
+                      ContentType="application/json",
+                      Tagging="reapable=true")
         print(f"wrote job timing ({status}, {len(completed_total_ms)}/{shard_count} "
               f"shards) -> s3://{S3_BUCKET}/{key}")
     except Exception as e:

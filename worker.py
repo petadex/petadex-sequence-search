@@ -219,7 +219,8 @@ def write_shard_timing(session_id, job_id, shard_index, timings, status, error=N
         key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.meta.json"
         s3.put_object(Bucket=S3_BUCKET, Key=key,
                       Body=json.dumps(doc).encode(),
-                      ContentType="application/json")
+                      ContentType="application/json",
+                      Tagging="reapable=true")  # reaped with the parts (see part_key)
         print(f"wrote timing sidecar -> s3://{S3_BUCKET}/{key}")
     except Exception as e:
         print(f"WARN write_shard_timing failed (shard {shard_index}): {e}")
@@ -265,8 +266,13 @@ def handler(event, context):
         n_hits = tsv.count("\n") if tsv else 0
         timings["num_hits"] = n_hits
         part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv"
+        # reapable=true: parts are write-once-then-dead once {jobId}.json exists
+        # (web app never re-reads them), so a tag-scoped lifecycle rule can expire
+        # them without ever touching the authoritative result. Requires
+        # s3:PutObjectTagging in the worker IAM (see infra/iam/worker-policy.json).
         s3.put_object(Bucket=S3_BUCKET, Key=part_key, Body=tsv.encode(),
-                      ContentType="text/tab-separated-values")
+                      ContentType="text/tab-separated-values",
+                      Tagging="reapable=true")
         print(f"wrote {n_hits} hits -> s3://{S3_BUCKET}/{part_key}")
 
         return {
