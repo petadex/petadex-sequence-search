@@ -119,6 +119,22 @@ s3://petadex/diamond/
 | `-b` (block size) | **1** | bounds RAM, not disk |
 | Per-shard timing | download ~78 s, search ~190 s, total ~290 s (measured at `--very-sensitive`) | job wall ~5 min; default mode reduces search time |
 
+### Warm cache, cold starts & the download lever
+
+**The ~78 s shard download dominates the ~37 s search — it is the single biggest latency lever, and it is largely unavoidable at current query volume.** Each worker caches its `.dmnd` in `/tmp` and reuses it across warm invocations, but that cache only pays off when a warm container is handed the *same* shard again:
+
+- A `.dmnd` shard is ~6 GB and `/tmp` is 10 GB, so **only one shard fits at a time.** Before downloading, the worker evicts any other cached shard (otherwise a second 6 GB download overflows `/tmp` with `No space left on device`).
+- Lambda warm-container routing is **not shard-affine** (Hard Constraint #5) — there is no guarantee that the container holding shard *N* is the one invoked for shard *N* next time. A warm container handed a different shard evicts and re-downloads.
+- At low query volume, containers rarely stay warm between searches anyway, so **nearly every search is effectively cold**: ~20 parallel cold downloads of ~78 s each. The design assumes this ("plan for cold-dominated economics") — it is why S3 was chosen over EFS, and why end-to-end latency is ~5 min, not ~40 s.
+
+The ~78 s/shard download is the **Lambda per-function network ceiling** (~78 MB/s) at this object size, not a connection-pool or tuning issue (investigated — a pool fix changed nothing). So the download can't be meaningfully sped *per worker*; reducing it means changing the storage/caching model. The documented reopen levers, **only worth pulling if query volume rises** (otherwise the flat cost isn't justified):
+
+- **EFS or a small persistent instance** — shards resident on a shared mount, no per-query download. ~$60/mo flat vs ~$2.80/mo for S3; this is the explicit S3-vs-EFS reopen condition.
+- **Provisioned/warm pool with shard affinity** — keep N warm containers, each pinned to a shard. Hard because Lambda doesn't expose affinity; would need careful routing.
+- **More, smaller shards** — smaller `.dmnd` per worker downloads faster in parallel, lowering wall time, at the cost of more invocations per search. The `/tmp` ceiling permits as few as ~15 shards but allows going higher.
+
+Until volume justifies one of these, the download cost is accepted by design. If it stops being acceptable, EFS is the first lever to pull.
+
 ### Result S3 layout & contract
 
 The **contract is unchanged** from the legacy path, so the web app needs only a function-name swap:
