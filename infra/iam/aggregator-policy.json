@@ -5,7 +5,7 @@
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": "arn:aws:logs:us-east-1:797308887321:*"
+      "Resource": "arn:aws:logs:us-east-1:REPLACE_ACCOUNT_ID:*"
     },
     {
       "Sid": "ListParts",

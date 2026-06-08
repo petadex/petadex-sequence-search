@@ -5,7 +5,7 @@
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": "arn:aws:logs:us-east-1:797308887321:*"
+      "Resource": "arn:aws:logs:us-east-1:REPLACE_ACCOUNT_ID:*"
     },
     {
       "Sid": "ReadDiamondPointers",
@@ -27,7 +27,7 @@
       "Sid": "StartSearchExecution",
       "Effect": "Allow",
       "Action": ["states:StartExecution"],
-      "Resource": "arn:aws:states:us-east-1:797308887321:stateMachine:petadex-diamond-search"
+      "Resource": "arn:aws:states:us-east-1:REPLACE_ACCOUNT_ID:stateMachine:petadex-diamond-search"
     }
   ]
 }

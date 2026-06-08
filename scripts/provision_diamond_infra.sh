@@ -40,7 +40,7 @@
 
 set -euo pipefail
 
-ACCOUNT_ID="${ACCOUNT_ID:-797308887321}"
+ACCOUNT_ID="${ACCOUNT_ID:?set ACCOUNT_ID to your 12-digit AWS account ID}"
 REGION="${AWS_REGION:-us-east-1}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-petadex-mmseq2-search}"
 IMAGE_URI="${IMAGE_URI:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPOSITORY}:latest}"
@@ -77,14 +77,18 @@ ensure_role() {  # name  trust-file  policy-name  policy-file
 }
 
 echo "[1/4] IAM roles"
-# Aggregator policy embeds the secret ARN — substitute into a temp copy.
-sed "s|REPLACE_DB_SECRET_ARN|${DB_SECRET_ARN}|g" \
-  "$IAM_DIR/aggregator-policy.json" > "$TMP/aggregator-policy.json"
+# Policy files use REPLACE_ACCOUNT_ID (and the aggregator REPLACE_DB_SECRET_ARN)
+# as placeholders so no real account ID is committed — substitute into temp copies.
+for f in aggregator-policy orchestrator-policy worker-policy statemachine-policy github-actions-lambda-invoke; do
+  sed -e "s|REPLACE_ACCOUNT_ID|${ACCOUNT_ID}|g" \
+      -e "s|REPLACE_DB_SECRET_ARN|${DB_SECRET_ARN}|g" \
+      "$IAM_DIR/$f.json" > "$TMP/$f.json"
+done
 
-ensure_role "${ORCH_FN}-role"   "$IAM_DIR/lambda-trust.json"       orchestrator-policy "$IAM_DIR/orchestrator-policy.json"
-ensure_role "${WORKER_FN}-role" "$IAM_DIR/lambda-trust.json"       worker-policy       "$IAM_DIR/worker-policy.json"
+ensure_role "${ORCH_FN}-role"   "$IAM_DIR/lambda-trust.json"       orchestrator-policy "$TMP/orchestrator-policy.json"
+ensure_role "${WORKER_FN}-role" "$IAM_DIR/lambda-trust.json"       worker-policy       "$TMP/worker-policy.json"
 ensure_role "${AGG_FN}-role"    "$IAM_DIR/lambda-trust.json"       aggregator-policy   "$TMP/aggregator-policy.json"
-ensure_role "${SM_NAME}-role"   "$IAM_DIR/statemachine-trust.json" statemachine-policy "$IAM_DIR/statemachine-policy.json"
+ensure_role "${SM_NAME}-role"   "$IAM_DIR/statemachine-trust.json" statemachine-policy "$TMP/statemachine-policy.json"
 
 # Aggregator needs VPC ENI management only if it runs in a VPC to reach RDS.
 if [[ -n "${VPC_SUBNET_IDS:-}" ]]; then
@@ -100,7 +104,7 @@ if aws iam get-role --role-name "$GHA_ROLE" >/dev/null 2>&1; then
   echo "  updating $GHA_ROLE inline policy petadex-lambda-invoke"
   aws iam put-role-policy --role-name "$GHA_ROLE" \
     --policy-name petadex-lambda-invoke \
-    --policy-document "file://$IAM_DIR/github-actions-lambda-invoke.json" >/dev/null
+    --policy-document "file://$TMP/github-actions-lambda-invoke.json" >/dev/null
 else
   echo "::warning:: CI role $GHA_ROLE not found — skipping lambda-invoke grant"
 fi
