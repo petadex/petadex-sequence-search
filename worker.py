@@ -67,6 +67,16 @@ THREADS = int(os.environ.get("DIAMOND_THREADS", os.cpu_count() or 2))
 #   DIAMOND_MASKING=0  → `--masking 0` (S2: skip per-call repeat masking)
 INDEX_CHUNKS = os.environ.get("DIAMOND_CHUNKS", "").strip()
 MASKING = os.environ.get("DIAMOND_MASKING", "").strip()
+# DB-format streaming benchmark ("06"): the worker reads either the native
+# `.dmnd` (default / production) or a compressed-FASTA DB (`.fa.zst`/`.fa.gz`),
+# chosen purely by the shard key's extension — so a production switch is just a
+# manifest key change and a benchmark is a direct invoke with the other key.
+# A FASTA-as-DB has no prebuilt seed index, so it MUST run as a single reference
+# block (`-b6`) or DIAMOND emits per-block top-k without a global merge and
+# over-reports hits (root-caused in doc 06). 8.8 GB peak RSS at -b6 fits the
+# 10 GB worker tier.
+FASTA_BLOCK_SIZE = os.environ.get("DIAMOND_FASTA_BLOCK_SIZE", "6")
+_FASTA_SUFFIXES = (".fa.zst", ".fa.gz", ".fasta.gz", ".fasta.zst", ".fa", ".fasta")
 # Effective reference-DB size (residues) for e-value calibration. Normally
 # threaded from the manifest via the event (`dbSize`); this env is a manual
 # override fallback. See docs/evalue-calibration.md.
@@ -111,43 +121,56 @@ def resolve_shard_key(event):
     return f"diamond/{version}/shard_{idx:02d}.dmnd"
 
 
+def is_fasta_db(path):
+    """True if `path` is a (optionally compressed) FASTA used directly as the DB,
+    vs a native `.dmnd`. Drives the `-d` arg form and the `-b6` requirement."""
+    return path.endswith(_FASTA_SUFFIXES)
+
+
 def download_shard(shard_key):
-    """Download the shard .dmnd to /tmp, cached across warm invocations.
+    """Download the shard DB to /tmp, cached across warm invocations. Returns the
+    local file path (full filename, including extension).
 
     Version-pinned (not LATEST-following): the key already names a frozen
-    version, so a cached file is always valid for that key. DIAMOND adds the
-    `.dmnd` suffix itself, so the local db path passed to `-d` omits it.
+    version, so a cached file is always valid for that key. Works for any DB
+    format (`.dmnd` or `.fa.zst`/`.fa.gz`); run_shard_search derives the DIAMOND
+    `-d` argument from the returned path.
     """
-    basename = os.path.basename(shard_key)                # shard_00.dmnd
+    basename = os.path.basename(shard_key)                # shard_00.dmnd / .fa.zst
     local_path = f"/tmp/{basename}"
-    db_path = local_path[:-len(".dmnd")]                  # /tmp/shard_00
 
-    # A shard .dmnd is ~6 GB and /tmp is 10 GB, so only ONE fits at a time.
-    # Warm-container routing is NOT shard-affine — Lambda may hand this warm
-    # container a different shard than its last invocation — so a naive
-    # "cache across warm invocations" leaves the previous 6 GB shard on disk
-    # and the next download overflows /tmp with [Errno 28] No space left on
-    # device. Evict every other cached shard before proceeding; the wanted
-    # shard (if present) is kept, so same-shard reuse is still a cache hit.
-    for other in glob.glob("/tmp/shard_*.dmnd"):
-        if other != local_path:
+    # A shard is ~1–6 GB and /tmp is 10 GB, so only ONE fits at a time. Warm-
+    # container routing is NOT shard-affine — Lambda may hand this warm container
+    # a different shard (or format) than its last invocation — so a naive "cache
+    # across warm invocations" leaves the previous multi-GB shard on disk and the
+    # next download overflows /tmp with [Errno 28]. Evict every OTHER cached
+    # shard (any format) before proceeding; the wanted file (if present) is kept,
+    # so same-shard reuse is still a cache hit.
+    for other in glob.glob("/tmp/shard_*"):
+        if other != local_path and os.path.isfile(other):
             print(f"evicting stale cached shard: {other}")
             os.remove(other)
 
     if os.path.exists(local_path):
         print(f"shard cached: {local_path}")
-        return db_path
+        return local_path
 
     print(f"downloading s3://{S3_BUCKET}/{shard_key} -> {local_path}")
     t0 = time.time()
     s3.download_file(S3_BUCKET, shard_key, local_path, Config=S3_TRANSFER_CONFIG)
     print(f"TIMING shard_download: {time.time() - t0:.2f}s "
           f"({os.path.getsize(local_path) / 1024 / 1024:.0f} MB)")
-    return db_path
+    return local_path
 
 
-def run_shard_search(query_fasta, db_path, max_results, dbsize=None):
-    """Run `diamond blastp` for this shard; return the raw outfmt-6 TSV text."""
+def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None):
+    """Run `diamond blastp` for this shard; return the raw outfmt-6 TSV text.
+
+    `db_local_path` is the downloaded file (full name). DIAMOND wants the bare
+    basename for a native `.dmnd` (it appends `.dmnd` itself) but the FULL
+    filename for a FASTA-as-DB, and the FASTA path must use a single reference
+    block (`-b6`) for a correct global top-k (see is_fasta_db / doc 06).
+    """
     query_file = "/tmp/query.fasta"
     with open(query_file, "w") as f:
         f.write(query_fasta if query_fasta.endswith("\n") else query_fasta + "\n")
@@ -156,12 +179,19 @@ def run_shard_search(query_fasta, db_path, max_results, dbsize=None):
     if os.path.exists(out_file):
         os.remove(out_file)
 
+    if is_fasta_db(db_local_path):
+        db_arg = db_local_path                       # FASTA: full filename
+        block = FASTA_BLOCK_SIZE                      # single block (correctness)
+    else:
+        db_arg = db_local_path[:-len(".dmnd")]       # native: bare basename
+        block = str(BLOCK_SIZE)
+
     cmd = [
         "diamond", "blastp",
         "-q", query_file,
-        "-d", db_path,
+        "-d", db_arg,
         "-o", out_file,
-        "-b", str(BLOCK_SIZE),
+        "-b", block,
         "-k", str(max_results),
         "--threads", str(THREADS),
     ]
@@ -266,11 +296,10 @@ def handler(event, context):
         shard_key = resolve_shard_key(event)
 
         d0 = time.monotonic()
-        db_path = download_shard(shard_key)
+        db_path = download_shard(shard_key)          # full local file path
         timings["download_ms"] = round((time.monotonic() - d0) * 1000, 1)
-        local_path = db_path + ".dmnd"
-        if os.path.exists(local_path):
-            timings["shard_size_bytes"] = os.path.getsize(local_path)
+        if os.path.exists(db_path):
+            timings["shard_size_bytes"] = os.path.getsize(db_path)
 
         s0 = time.monotonic()
         tsv = run_shard_search(query_fasta, db_path, max_results, dbsize=dbsize)
