@@ -59,6 +59,14 @@ SENSITIVITY = os.environ.get("DIAMOND_SENSITIVITY", "--very-sensitive").strip()
 BLOCK_SIZE = os.environ.get("DIAMOND_BLOCK_SIZE", "1")   # -b; Check 5: 0.5–1
 # Lambda allocates ~1 vCPU per 1769 MB; os.cpu_count() reflects that.
 THREADS = int(os.environ.get("DIAMOND_THREADS", os.cpu_count() or 2))
+# Search-flag overrides for the Search Optimization 07 benchmarks (Benjamin
+# Buchfink's suggestions). Both default to empty → flag omitted → DIAMOND's own
+# default (= current production behavior), so this is a no-op until the worker
+# env sets them.
+#   DIAMOND_CHUNKS=1   → `-c1`        (S1: one index chunk, single reference pass)
+#   DIAMOND_MASKING=0  → `--masking 0` (S2: skip per-call repeat masking)
+INDEX_CHUNKS = os.environ.get("DIAMOND_CHUNKS", "").strip()
+MASKING = os.environ.get("DIAMOND_MASKING", "").strip()
 # Effective reference-DB size (residues) for e-value calibration. Normally
 # threaded from the manifest via the event (`dbSize`); this env is a manual
 # override fallback. See docs/evalue-calibration.md.
@@ -160,6 +168,11 @@ def run_shard_search(query_fasta, db_path, max_results, dbsize=None):
     # Omit the flag for an empty/"default"/"none" value → DIAMOND default mode.
     if SENSITIVITY and SENSITIVITY.lower() not in ("default", "none"):
         cmd.append(SENSITIVITY)
+    # S1/S2 search-flag overrides (empty ⇒ omit ⇒ DIAMOND default = prod today).
+    if INDEX_CHUNKS:
+        cmd += ["-c", INDEX_CHUNKS]
+    if MASKING != "":
+        cmd += ["--masking", MASKING]
     # Calibrate e-values against the FULL corpus, not this ~1/20 shard. Without
     # --dbsize, DIAMOND uses the shard's own residue count, so e-values come out
     # ~SHARD_COUNT× too significant (E ∝ database size). dbsize = total corpus
