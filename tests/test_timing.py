@@ -44,6 +44,23 @@ class _Body:
         return self._data
 
 
+# --- worker: FASTA single-block sizing (anti-OOM, §10.13) ----------------------
+
+def test_fasta_block_size_sized_to_shard():
+    """A FASTA-as-DB must run as one block; -b = ceil(letters/1e9). This is what
+    lets a 32-shard zstd shard (-b4) fit Lambda where a 20-shard one (-b6) OOMs."""
+    assert worker.fasta_block_size(5_250_000_000) == "6"   # 20 shards -> OOM tier
+    assert worker.fasta_block_size(3_280_000_000) == "4"   # 32 shards -> fits
+    assert worker.fasta_block_size(2_620_000_000) == "3"   # 40 shards
+    assert worker.fasta_block_size(4_000_000_000) == "4"   # exact boundary
+
+
+def test_fasta_block_size_falls_back_to_env_when_unknown():
+    """No per-shard letters (pre-letters manifest/event) -> the env default."""
+    assert worker.fasta_block_size(None) == worker.FASTA_BLOCK_SIZE
+    assert worker.fasta_block_size("") == worker.FASTA_BLOCK_SIZE
+
+
 # --- worker: write_shard_timing -------------------------------------------------
 
 def test_write_shard_timing_key_and_payload():

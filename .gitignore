@@ -208,6 +208,9 @@ __marimo__/
 
 # PETadex specific
 CLAUDE.md
+.claude/*
+archive/*
+06 DB-Format Streaming Benchmark.md
 
 # AWS credentials and sensitive data
 petadex-s3-credentials.txt
