@@ -55,42 +55,19 @@ from boto3.s3.transfer import TransferConfig
 DEFAULT_BUCKET = "petadex"
 DEFAULT_KEY = "logan/petadex.catalytic_orfs.v1.1.fa"
 CORPUS_COUNT = 307_155_746  # Phase 0 Check 0 ground truth
+CORPUS_LETTERS = 104_940_484_545  # total residues (backfilled estimate, §10.8)
+# 32 (was Phase 0's 20): a 20-shard zstd shard (~5.25 Gletters) forces a single
+# `-b6` reference block that OOMs the 10 GiB Lambda tier; 32 shards (~3.28
+# Gletters -> -b4) fit. Finer sharding also shortens each worker's download+search
+# and adds /tmp headroom for the .dmnd path. See the db-format memory note and §10.13.
+DEFAULT_SHARD_COUNT = 32
 DIAMOND_PREFIX = "diamond"  # s3://{bucket}/diamond/...
 
-# --- Sharding granularity for the zstd path ----------------------------------
-# zstd-as-DB is correct only when each shard is a SINGLE DIAMOND reference block:
-# with --dbsize the letter count is skipped (sequences: 0), so per-block top-k are
-# NOT globally merged and a multi-block shard OVER-REPORTS (doc 06 / CLAUDE.md
-# §9.1). So shard size is bounded by what fits ONE block in RAM:
-#
-#   block letters ≈ -b × 1e9;   peak RSS ≈ 1.9 GB @ -b1 ... 8.8 GB @ -b6 (measured)
-#
-# Crucially, the 10 GB Lambda tier is ALREADY in use for vCPUs (search is CPU-
-# bound, §10.6), so minimizing RSS buys nothing — the only memory question is
-# "does the single block fit under 10 GB?". It does even at the current 20 shards
-# (5.25 G letters → -b6 → 8.8 GB). So MEMORY PERMITS AS FEW AS ~20 SHARDS; it does
-# not push toward many. (/tmp is a non-issue for zstd: a shard is ~1 GB, streamed.)
-#
-# The TOP is capped by reserved concurrency, NOT memory: one search fans out one
-# worker per shard, so shard_count must stay <= WORKER_RESERVED_CONCURRENCY /
-# peak-concurrent-searches (§10.6: reserved=100 → 20 shards = 5 concurrent searches;
-# 32 shards ≈ 3; >100 shards can't run even ONE search). Sharding finer only trades
-# per-shard search latency for fan-out/concurrency budget (the §9.1 tradeoff).
-#
-# Reasonable window: ~20 (memory floor, -b6, tight RSS) to ~40 (comfortable RSS,
-# 2–3 concurrent). Default 32 ≈ 3.3 G letters/shard → one block at -b4 (~6 GB RSS)
-# with ~3 concurrent searches under the existing reserved=100. ⚠️ Workers MUST set
-# DIAMOND_BLOCK_SIZE so the whole shard is one block (-b4 at 32 shards), and raising
-# shard_count REQUIRES bumping WORKER_RESERVED_CONCURRENCY in
-# scripts/provision_diamond_infra.sh first. Pin the exact count after benchmarking.
-CORPUS_LETTERS_ESTIMATE = 104_940_484_545   # live-manifest total_letters
-LETTERS_PER_B = 1_000_000_000               # block ≈ -b × 1e9 letters
-RSS_BASE_GB = 1.9                           # measured peak RSS at -b1
-RSS_PER_B_GB = 1.38                         # measured slope (1.9 @ -b1 → 8.8 @ -b6)
-LAMBDA_MEM_GB = 10                           # the tier already provisioned for vCPUs
-WORKER_RESERVED_CONCURRENCY = 100            # CLAUDE.md §10.6 (provisioned)
-DEFAULT_SHARD_COUNT = 32                     # ~3.3 G letters/shard, -b4, ~6 GB RSS, ~3 concurrent
-DEFAULT_ZSTD_LEVEL = 19                      # Benjamin's rec; benchmark-validated (1.06 GiB)
+# A FASTA-as-DB (zstd) must search as a SINGLE reference block; that block's
+# peak RSS scales with `-b`. -b6 OOM-killed Lambda's 10 GiB max tier (measured
+# 2026-06-09), so the build refuses any shard count whose single block needs
+# -b >= this. ceil(CORPUS_LETTERS / ((LIMIT-1) * 1e9)) shards stays at or below it.
+FASTA_BLOCK_LIMIT = 5
 
 # Mirror the multipart tuning the Lambda download path uses (lambda_function.py).
 S3_TRANSFER_CONFIG = TransferConfig(
@@ -129,11 +106,10 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
     newline, so it is handled explicitly). The trailing fragment of each chunk
     is held back as `leftover` until the next chunk completes it.
 
-    Returns (per-shard sequence counts, per-shard residue counts, total records).
-    Residues are counted exactly here (bytes after each record's first newline,
-    minus internal newlines) so the manifest's `letters`/`total_letters` is exact
-    for ANY format — the zstd path has no `.dmnd` to run `diamond dbinfo` on, and
-    exact beats the live manifest's striped-sample estimate for --dbsize anyway.
+    Returns (per-shard sequence counts, total records, per-shard residue counts).
+    The residue counts are summed cheaply during this pass (count non-newline
+    bytes after each record's header line) so the zstd path has per-shard
+    `letters` for the manifest without a `diamond dbinfo` (it builds no `.dmnd`).
     """
     obj = s3.get_object(Bucket=bucket, Key=key)
     obj_size = obj["ContentLength"]
@@ -141,6 +117,7 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
     shard_size = math.ceil(CORPUS_COUNT / shard_count)
 
     counts = [0] * shard_count
+    letters = [0] * shard_count
     letters = [0] * shard_count
     handles = [open(p, "wb", buffering=1024 * 1024) for p in shard_paths]
     record_index = 0
@@ -162,11 +139,9 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
         handles[sh].write(rec)
         handles[sh].write(b"\n")  # the '\n' that the split delimiter consumed
         counts[sh] += 1
-        # Residues = bytes after the header line (first '\n'), minus the internal
-        # newlines of wrapped/multi-line sequences. The trailing delimiter '\n'
-        # was consumed by the split, so it is not in `rec`.
+        # Residues = bytes after the header line, minus its internal newlines.
         nl = rec.find(b"\n")
-        if nl >= 0:
+        if nl != -1:
             seq = rec[nl + 1:]
             letters[sh] += len(seq) - seq.count(b"\n")
         record_index += 1
@@ -217,7 +192,7 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
     elif record_index != CORPUS_COUNT:
         print(f"  WARNING: parsed {record_index:,} records but expected "
               f"{CORPUS_COUNT:,} (Check 0). Investigate before publishing.")
-    return counts, letters, record_index
+    return counts, record_index, letters
 
 
 def build_shard(fasta_path, dmnd_base, threads):
@@ -242,29 +217,59 @@ def build_shard(fasta_path, dmnd_base, threads):
     return dmnd_path, size
 
 
-def compress_shard_zstd(fasta_path, level, threads):
-    """zstd arm: zstd -<level> the shard FASTA -> shard.fasta.zst. (path, size).
+def compress_shard(fasta_path, base, level, threads):
+    """zstd-compress a shard FASTA into `{base}.fa.zst` — the artifact DIAMOND
+    2.2.x reads directly as `-d` (built WITH_ZSTD=ON). Returns (path, bytes).
 
-    DIAMOND built WITH_ZSTD=ON reads the `.zst` directly as the DB — no makedb,
-    no on-disk decompression (it streams the FASTA out of the compressed file).
-    The smaller artifact is the whole point: doc 06 measured shard_00 at 1.06 GiB
-    vs 5.60 GiB for `.dmnd` — a 5.3× smaller transfer. Workers MUST pass --dbsize
-    (manifest total_letters) or DIAMOND re-runs a ~92 s letter-count pass on open.
-    """
-    zst_path = Path(f"{fasta_path}.zst")  # shard_NN.fasta.zst
-    cmd = ["zstd", f"-{level}", f"-T{threads or 0}", "-f",
-           "-o", str(zst_path), str(fasta_path)]
+    No `diamond makedb` runs for the zstd format: the compressed FASTA *is* the
+    shard. It carries no prebuilt seed index, which is why the worker must search
+    it as a single reference block (see worker.fasta_block_size)."""
+    out = Path(f"{base}.fa.zst")
+    cmd = ["zstd", "-q", "-f", f"-{level}", f"-T{threads}",
+           str(fasta_path), "-o", str(out)]
     print(f"  $ {' '.join(cmd)}")
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
-        raise RuntimeError(f"zstd compression failed for {fasta_path}")
-    if not zst_path.exists():
-        raise RuntimeError(f"expected {zst_path} after zstd, not found")
-    size = zst_path.stat().st_size
-    print(f"    -> {zst_path.name}  {human(size)}  in {time.time() - t0:.0f}s")
-    return zst_path, size
+        raise RuntimeError(f"zstd failed for {fasta_path}")
+    if not out.exists():
+        raise RuntimeError(f"expected {out} after zstd, not found")
+    size = out.stat().st_size
+    print(f"    -> {out.name}  {human(size)}  in {time.time() - t0:.0f}s")
+    return out, size
+
+
+def require_zstd():
+    """Fail early (before the long stream) if the `zstd` CLI is missing."""
+    try:
+        subprocess.run(["zstd", "--version"], capture_output=True, check=True)
+    except Exception:
+        raise SystemExit(
+            "ERROR: --format zstd needs the `zstd` CLI, not found on PATH.\n"
+            "  Amazon Linux 2:  sudo yum install -y zstd\n"
+            "  Debian/Ubuntu:   sudo apt-get install -y zstd")
+
+
+def shard_letters(dmnd_base):
+    """Residue (letter) count of a built .dmnd, via `diamond dbinfo`.
+
+    Recorded in the manifest as total_letters and passed to workers as
+    --dbsize, so per-shard e-values calibrate against the full corpus instead
+    of a single shard (see docs/evalue-calibration.md). Returns 0 if it can't
+    be parsed — the build still proceeds; dbsize just won't be recorded.
+    """
+    try:
+        out = subprocess.run(["diamond", "dbinfo", "-d", str(dmnd_base)],
+                             capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            if "letters" in line.lower():
+                digits = "".join(ch for ch in line if ch.isdigit())
+                if digits:
+                    return int(digits)
+    except Exception as e:
+        print(f"    WARNING: diamond dbinfo failed for {dmnd_base}: {e}")
+    return 0
 
 
 def database_release(corpus_key):
@@ -309,16 +314,14 @@ def main():
     ap.add_argument("--bucket", default=DEFAULT_BUCKET)
     ap.add_argument("--key", default=DEFAULT_KEY,
                     help="corpus FASTA object key (NOT the RDS table)")
-    ap.add_argument("--shard-count", type=int, default=DEFAULT_SHARD_COUNT,
-                    help="number of shards (= workers per search; MUST be <= "
-                         "worker reserved concurrency, see CLAUDE.md §10.6)")
+    ap.add_argument("--shard-count", type=int, default=DEFAULT_SHARD_COUNT)
     ap.add_argument("--format", choices=["dmnd", "zstd"], default="dmnd",
-                    help="shard artifact format. dmnd = native (seed index, the "
-                         "current production format); zstd = compressed FASTA-as-DB "
-                         "(5.3x smaller transfer, needs finer shards for -b1 "
-                         "correctness — see the granularity note up top).")
-    ap.add_argument("--zstd-level", type=int, default=DEFAULT_ZSTD_LEVEL,
-                    help="zstd compression level (only used by --format zstd)")
+                    help="shard artifact: native .dmnd (default, production) or "
+                         ".fa.zst compressed-FASTA-as-DB (smaller download; needs "
+                         "DIAMOND built WITH_ZSTD and finer sharding to fit Lambda "
+                         "memory — see §10.13)")
+    ap.add_argument("--zstd-level", type=int, default=19,
+                    help="zstd compression level for --format zstd (default 19)")
     ap.add_argument("--partition", choices=["round-robin", "contiguous"],
                     default="round-robin")
     ap.add_argument("--version",
@@ -346,6 +349,22 @@ def main():
         ap.error("--max-records is a smoke test and must not publish; "
                  "pass --skip-upload or --no-bump-latest too.")
 
+    # zstd memory guard: a FASTA-as-DB must search as a single reference block,
+    # whose -b (= ceil(letters/1e9)) drives Lambda RSS. -b6 OOM'd the 10 GiB tier,
+    # so refuse a shard count whose block would need -b >= FASTA_BLOCK_LIMIT.
+    if args.format == "zstd":
+        est_shard_letters = CORPUS_LETTERS / args.shard_count
+        rec_b = math.ceil(est_shard_letters / 1e9)
+        min_shards = math.ceil(CORPUS_LETTERS / ((FASTA_BLOCK_LIMIT - 1) * 1e9))
+        if rec_b >= FASTA_BLOCK_LIMIT:
+            ap.error(
+                f"--format zstd with {args.shard_count} shards needs a single "
+                f"reference block of -b{rec_b} (~{est_shard_letters/1e9:.1f} "
+                f"Gletters/shard); -b>={FASTA_BLOCK_LIMIT} OOMs the 10 GiB Lambda "
+                f"tier. Use --shard-count >= {min_shards}.")
+        print(f"zstd single-block size ~ -b{rec_b} "
+              f"(~{est_shard_letters/1e9:.1f} Gletters/shard) — fits the 10 GiB tier.")
+
     version = args.version or (
         "catalytic_orfs_v1.1_"
         + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
@@ -358,7 +377,7 @@ def main():
     print(f"corpus      s3://{args.bucket}/{args.key}")
     print(f"version     {version}")
     print(f"format      {args.format}"
-          + (f" (zstd -{args.zstd_level})" if args.format == "zstd" else ""))
+          + (f"  (zstd level {args.zstd_level})" if args.format == "zstd" else ""))
     print(f"shards      {args.shard_count}  ({args.partition})")
     print(f"shard_size  {shard_size:,} seqs/shard (contiguous target)")
     est_letters_per_shard = CORPUS_LETTERS_ESTIMATE // args.shard_count
@@ -404,9 +423,12 @@ def main():
         print("dry run — exiting before any disk or S3 work.")
         return
 
+    if args.format == "zstd":
+        require_zstd()  # fail before the long stream if the CLI is absent
     scratch.mkdir(parents=True, exist_ok=True)
     s3 = boto3.client("s3", region_name="us-east-1")
 
+    ext = ".fa.zst" if args.format == "zstd" else ".dmnd"
     width = len(str(args.shard_count - 1))
     fasta_paths = [scratch / f"shard_{i:0{width}d}.fasta"
                    for i in range(args.shard_count)]
@@ -414,41 +436,48 @@ def main():
 
     # [1/4] Stream + partition the corpus in a single pass (counts residues too).
     print(f"\n[1/4] Streaming corpus and partitioning into {args.shard_count} shards...")
-    counts, letters, total = stream_and_partition(
+    counts, total, counted_letters = stream_and_partition(
         s3, args.bucket, args.key, fasta_paths, args.partition, args.shard_count,
         max_records=args.max_records)
     for i, c in enumerate(counts):
         print(f"  shard_{i:0{width}d}: {c:,} seqs / {letters[i]:,} letters "
               f"({human(fasta_paths[i].stat().st_size)} FASTA)")
 
-    # [2/4] Build each shard artifact (dmnd makedb or zstd -19), then delete the
-    # FASTA right after to bound scratch use. artifact_paths drives both upload
-    # and the manifest `key`, so the format is carried by the filename.
-    print(f"\n[2/4] Building {args.shard_count} shard artifacts ({args.format})...")
+    # [2/4] Build each shard artifact; delete the FASTA right after to bound
+    # scratch use (for zstd the .fa.zst is the artifact, so the .fasta still goes).
+    print(f"\n[2/4] Building {args.shard_count} {args.format} shards...")
+    dmnd_sizes = []
+    dmnd_letters = []
     artifact_paths = []
-    artifact_sizes = []
     for i in range(args.shard_count):
         print(f"shard_{i:0{width}d}:")
-        if args.format == "dmnd":
-            art_path, size = build_shard(fasta_paths[i], dmnd_bases[i], args.threads)
-        else:  # zstd: compress the shard FASTA in place
-            art_path, size = compress_shard_zstd(
-                fasta_paths[i], args.zstd_level, args.threads)
-        artifact_paths.append(art_path)
-        artifact_sizes.append(size)
+        if args.format == "zstd":
+            # No makedb: compress the FASTA; letters come from the streaming pass
+            # (a .fa.zst has no .dmnd to run `diamond dbinfo` on).
+            out, size = compress_shard(fasta_paths[i], dmnd_bases[i],
+                                       args.zstd_level, args.threads)
+            letters = counted_letters[i]
+            artifact_paths.append(out)
+        else:
+            size, letters = build_shard(fasta_paths[i], dmnd_bases[i], args.threads)
+            artifact_paths.append(Path(f"{dmnd_bases[i]}.dmnd"))
+        dmnd_sizes.append(size)
+        dmnd_letters.append(letters)
         if not args.keep_fasta:
-            fasta_paths[i].unlink(missing_ok=True)
-    print(f"  total {args.format} bytes: {human(sum(artifact_sizes))}")
+            fasta_paths[i].unlink()
+    print(f"  total {args.format}: {human(sum(dmnd_sizes))}")
 
     # [3/4] Upload shards.
     shard_keys = []
     if args.skip_upload:
+        print(f"\n[3/4] --skip-upload: leaving {args.format} shards on scratch, no S3 writes.")
         print(f"\n[3/4] --skip-upload: leaving {args.format} shards on scratch, no S3 writes.")
     else:
         print(f"\n[3/4] Uploading {args.shard_count} shards to s3://{args.bucket}/"
               f"{DIAMOND_PREFIX}/{version}/ ...")
         for i in range(args.shard_count):
             shard_keys.append(
+                upload_shard(s3, args.bucket, artifact_paths[i], version))
                 upload_shard(s3, args.bucket, artifact_paths[i], version))
 
     # [4/4] Manifest, then (last) LATEST.
@@ -461,10 +490,10 @@ def main():
         "build_date": datetime.now(timezone.utc).isoformat(),
         "corpus": f"s3://{args.bucket}/{args.key}",
         "diamond_version": diamond_version(),
-        # Shard artifact format ("dmnd" | "zstd"). The worker also infers it from
-        # the shardKey extension; recorded here for human/tooling clarity.
+        # Shard artifact format — "dmnd" (native) or "zstd" (.fa.zst FASTA-as-DB).
+        # The worker also infers it from the shard key extension; recorded here for
+        # at-a-glance manifest inspection.
         "format": args.format,
-        "zstd_level": args.zstd_level if args.format == "zstd" else None,
         "partition": args.partition,
         "shard_count": args.shard_count,
         "total_sequences": total,
@@ -479,9 +508,7 @@ def main():
         "shards": [
             {
                 "index": i,
-                # The exact uploaded key (artifact filename carries the format),
-                # so the worker's shardKey never reconstructs a pad width or suffix.
-                "key": f"{DIAMOND_PREFIX}/{version}/{artifact_paths[i].name}",
+                "key": f"{DIAMOND_PREFIX}/{version}/shard_{i:0{width}d}{ext}",
                 "sequences": counts[i],
                 "dmnd_bytes": artifact_sizes[i],
                 "letters": letters[i],
@@ -515,10 +542,9 @@ def main():
 
     print("\n" + "=" * 64)
     print("DONE.")
-    print(f"  shards built : {args.shard_count}  ({args.format})")
+    print(f"  shards built : {args.shard_count} ({args.format})")
     print(f"  sequences    : {total:,}")
-    print(f"  letters      : {sum(letters):,}")
-    print(f"  total bytes  : {human(sum(artifact_sizes))}")
+    print(f"  total bytes  : {human(sum(dmnd_sizes))}")
     print(f"  version      : {version}")
     if not args.skip_upload and not args.no_bump_latest:
         print("  LATEST now points here — workers will pick this up.")

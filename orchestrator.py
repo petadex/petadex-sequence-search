@@ -80,9 +80,14 @@ def load_shards(version):
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
     manifest = json.loads(obj["Body"].read())
     shards = [
-        # shardSeqs (per-shard sequence count, from the manifest) rides along for
-        # the timing telemetry's shard-count benchmark; the worker records it.
-        {"shardIndex": s["index"], "shardKey": s["key"], "shardSeqs": s.get("sequences")}
+        # shardSeqs (per-shard sequence count) rides along for the timing
+        # telemetry's shard-count benchmark; the worker records it. shardLetters
+        # (per-shard residue count) lets a FASTA-as-DB worker size its single
+        # reference block to the shard so finer shards fit Lambda memory; it is
+        # None for manifests built before the builder recorded per-shard letters
+        # (the worker then falls back to its env default). Unused on the .dmnd path.
+        {"shardIndex": s["index"], "shardKey": s["key"],
+         "shardSeqs": s.get("sequences"), "shardLetters": s.get("letters")}
         for s in manifest["shards"]
     ]
     if not shards:

@@ -41,6 +41,7 @@ worker emits the raw column untouched; the assertion lives in the merger.
 
 import glob
 import json
+import math
 import os
 import subprocess
 import time
@@ -79,9 +80,14 @@ MASKING = os.environ.get("DIAMOND_MASKING", "").strip()
 # chosen purely by the shard key's extension — so a production switch is just a
 # manifest key change and a benchmark is a direct invoke with the other key.
 # A FASTA-as-DB has no prebuilt seed index, so it MUST run as a single reference
-# block (`-b6`) or DIAMOND emits per-block top-k without a global merge and
-# over-reports hits (root-caused in doc 06). 8.8 GB peak RSS at -b6 fits the
-# 10 GB worker tier.
+# block or DIAMOND emits per-block top-k without a global merge and over-reports
+# hits (root-caused in doc 06). The single block's `-b` must be >= the shard's
+# residue count in billions, and `-b` drives peak RSS — so a 20-shard zstd shard
+# (~5.25 Gletters -> -b6) OOM-kills the 10 GiB Lambda tier, while a 32-shard
+# shard (~3.28 Gletters -> -b4) fits (db-format memory note, 2026-06-09). The
+# worker therefore sizes `-b` to the actual shard via `fasta_block_size()` from
+# the per-shard `letters` threaded in the event (`shardLetters`); this env is
+# only the fallback when that figure is absent (e.g. a pre-letters manifest).
 FASTA_BLOCK_SIZE = os.environ.get("DIAMOND_FASTA_BLOCK_SIZE", "6")
 _FASTA_SUFFIXES = (".fa.zst", ".fa.gz", ".fasta.gz", ".fasta.zst", ".fa", ".fasta")
 # Effective reference-DB size (residues) for e-value calibration. Normally
@@ -147,8 +153,28 @@ def shard_db_path(shard_key, local_path):
 
 def is_fasta_db(path):
     """True if `path` is a (optionally compressed) FASTA used directly as the DB,
-    vs a native `.dmnd`. Drives the `-d` arg form and the `-b6` requirement."""
+    vs a native `.dmnd`. Drives the `-d` arg form and the single-block requirement."""
     return path.endswith(_FASTA_SUFFIXES)
+
+
+def fasta_block_size(shard_letters):
+    """`-b` for a FASTA-as-DB: the smallest value that keeps it a SINGLE reference
+    block, sized to this shard.
+
+    A FASTA-as-DB has no prebuilt seed index, so it must run as one block (else
+    DIAMOND over-reports per-block top-k). `-b` is measured in *billions of
+    letters*, so the minimal single block is `ceil(shard_letters / 1e9)`. Sizing
+    it to the shard — rather than a fixed `-b6` — is what lets finer shards fit
+    Lambda's 10 GiB tier: 20 shards (~5.25 Gletters -> -b6) OOMs, 32 shards
+    (~3.28 Gletters -> -b4) fits. Falls back to DIAMOND_FASTA_BLOCK_SIZE when the
+    letter count is unknown (a manifest/event without per-shard `letters`)."""
+    try:
+        n = int(shard_letters)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return str(max(1, math.ceil(n / 1_000_000_000)))
+    return FASTA_BLOCK_SIZE
 
 
 def download_shard(shard_key):
@@ -187,13 +213,16 @@ def download_shard(shard_key):
     return local_path
 
 
-def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None):
+def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None,
+                     shard_letters=None):
     """Run `diamond blastp` for this shard; return the raw outfmt-6 TSV text.
 
     `db_local_path` is the downloaded file (full name). DIAMOND wants the bare
     basename for a native `.dmnd` (it appends `.dmnd` itself) but the FULL
     filename for a FASTA-as-DB, and the FASTA path must use a single reference
-    block (`-b6`) for a correct global top-k (see is_fasta_db / doc 06).
+    block for a correct global top-k — sized to this shard via
+    `fasta_block_size(shard_letters)` so finer shards fit memory (see is_fasta_db
+    / doc 06).
     """
     query_file = "/tmp/query.fasta"
     with open(query_file, "w") as f:
@@ -205,7 +234,7 @@ def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None):
 
     if is_fasta_db(db_local_path):
         db_arg = db_local_path                       # FASTA: full filename
-        block = FASTA_BLOCK_SIZE                      # single block (correctness)
+        block = fasta_block_size(shard_letters)       # single block, sized to shard
     else:
         db_arg = db_local_path[:-len(".dmnd")]       # native: bare basename
         block = str(BLOCK_SIZE)
@@ -307,6 +336,10 @@ def handler(event, context):
     # Effective full-corpus DB size for e-value calibration (manifest-derived,
     # threaded via the Map). 0/None ⇒ omit --dbsize (legacy per-shard behavior).
     dbsize = event.get("dbSize") or DBSIZE_ENV
+    # Per-shard residue count (manifest-derived, threaded via the Map). For a
+    # FASTA-as-DB this sizes the single reference block so finer shards fit Lambda
+    # memory; for a `.dmnd` it is unused. None ⇒ fall back to FASTA_BLOCK_SIZE env.
+    shard_letters = event.get("shardLetters")
 
     # Per-shard timing, captured with monotonic() and emitted as a sidecar in the
     # `finally` below so it fires whether the search succeeds or throws (a failed
@@ -326,7 +359,8 @@ def handler(event, context):
             timings["shard_size_bytes"] = os.path.getsize(db_path)
 
         s0 = time.monotonic()
-        tsv = run_shard_search(query_fasta, db_path, max_results, dbsize=dbsize)
+        tsv = run_shard_search(query_fasta, db_path, max_results, dbsize=dbsize,
+                               shard_letters=shard_letters)
         timings["search_ms"] = round((time.monotonic() - s0) * 1000, 1)
 
         n_hits = tsv.count("\n") if tsv else 0
