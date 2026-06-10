@@ -69,6 +69,17 @@ DIAMOND_PREFIX = "diamond"  # s3://{bucket}/diamond/...
 # -b >= this. ceil(CORPUS_LETTERS / ((LIMIT-1) * 1e9)) shards stays at or below it.
 FASTA_BLOCK_LIMIT = 5
 
+# Advisory build-plan model for the zstd single-block path (display only — these
+# do NOT affect build artifacts; the hard correctness guard above uses literal 1e9).
+# A reference block holds ~ -b x 1e9 letters; peak RSS scales linearly with -b:
+# measured 1.9 GB @ -b1 -> 8.8 GB @ -b6 (2026-06-09), i.e. 1.38 GB per unit -b.
+# Cross-check: 32 shards -> -b4 -> 1.9 + 1.38*3 = 6.04 GB (matches §10.13 "~6.0 GB").
+LETTERS_PER_B = 1_000_000_000
+RSS_BASE_GB = 1.9                 # peak RSS at -b1
+RSS_PER_B_GB = 1.38               # additional RSS per unit -b above 1
+LAMBDA_MEM_GB = 10                # worker Lambda max memory tier (§10.6)
+WORKER_RESERVED_CONCURRENCY = 100  # worker reserved concurrency (provision_diamond_infra.sh, §10.6)
+
 # Mirror the multipart tuning the Lambda download path uses (lambda_function.py).
 S3_TRANSFER_CONFIG = TransferConfig(
     multipart_chunksize=32 * 1024 * 1024,
@@ -380,7 +391,7 @@ def main():
           + (f"  (zstd level {args.zstd_level})" if args.format == "zstd" else ""))
     print(f"shards      {args.shard_count}  ({args.partition})")
     print(f"shard_size  {shard_size:,} seqs/shard (contiguous target)")
-    est_letters_per_shard = CORPUS_LETTERS_ESTIMATE // args.shard_count
+    est_letters_per_shard = CORPUS_LETTERS // args.shard_count
     need_b = max(1, math.ceil(est_letters_per_shard / LETTERS_PER_B))
     est_rss = RSS_BASE_GB + RSS_PER_B_GB * (need_b - 1)
     print(f"~letters/sh {est_letters_per_shard:,}")
@@ -395,7 +406,7 @@ def main():
         print(f"single-block: workers need DIAMOND_BLOCK_SIZE >= {need_b} "
               f"(-b{need_b}); est peak RSS ~{est_rss:.1f} GB / {LAMBDA_MEM_GB} GB tier")
         if est_rss > LAMBDA_MEM_GB - 1:
-            finer = math.ceil(CORPUS_LETTERS_ESTIMATE
+            finer = math.ceil(CORPUS_LETTERS
                               / ((LAMBDA_MEM_GB - 1 - RSS_BASE_GB) / RSS_PER_B_GB + 1)
                               / LETTERS_PER_B)
             print(f"  ⚠️  ~{est_rss:.1f} GB leaves <1 GB headroom under the "
@@ -440,7 +451,7 @@ def main():
         s3, args.bucket, args.key, fasta_paths, args.partition, args.shard_count,
         max_records=args.max_records)
     for i, c in enumerate(counts):
-        print(f"  shard_{i:0{width}d}: {c:,} seqs / {letters[i]:,} letters "
+        print(f"  shard_{i:0{width}d}: {c:,} seqs / {counted_letters[i]:,} letters "
               f"({human(fasta_paths[i].stat().st_size)} FASTA)")
 
     # [2/4] Build each shard artifact; delete the FASTA right after to bound
@@ -471,13 +482,11 @@ def main():
     shard_keys = []
     if args.skip_upload:
         print(f"\n[3/4] --skip-upload: leaving {args.format} shards on scratch, no S3 writes.")
-        print(f"\n[3/4] --skip-upload: leaving {args.format} shards on scratch, no S3 writes.")
     else:
         print(f"\n[3/4] Uploading {args.shard_count} shards to s3://{args.bucket}/"
               f"{DIAMOND_PREFIX}/{version}/ ...")
         for i in range(args.shard_count):
             shard_keys.append(
-                upload_shard(s3, args.bucket, artifact_paths[i], version))
                 upload_shard(s3, args.bucket, artifact_paths[i], version))
 
     # [4/4] Manifest, then (last) LATEST.
@@ -494,24 +503,26 @@ def main():
         # The worker also infers it from the shard key extension; recorded here for
         # at-a-glance manifest inspection.
         "format": args.format,
+        # zstd compression level the shards were built at (null for the .dmnd format).
+        "zstd_level": args.zstd_level if args.format == "zstd" else None,
         "partition": args.partition,
         "shard_count": args.shard_count,
         "total_sequences": total,
         "expected_sequences": CORPUS_COUNT,
         # On-disk bytes of the primary artifact (`.dmnd` or `.fasta.zst`). Name kept
         # as *_dmnd_bytes for backward compat; it is the artifact size for any format.
-        "total_dmnd_bytes": sum(artifact_sizes),
+        "total_dmnd_bytes": sum(dmnd_sizes),
         # Total corpus residues, counted EXACTLY in the streaming pass (no longer a
         # striped-sample estimate). Workers pass this as --dbsize so e-values
         # calibrate against the whole corpus, not one shard (docs/evalue-calibration.md).
-        "total_letters": sum(letters),
+        "total_letters": sum(dmnd_letters),
         "shards": [
             {
                 "index": i,
                 "key": f"{DIAMOND_PREFIX}/{version}/shard_{i:0{width}d}{ext}",
                 "sequences": counts[i],
-                "dmnd_bytes": artifact_sizes[i],
-                "letters": letters[i],
+                "dmnd_bytes": dmnd_sizes[i],
+                "letters": dmnd_letters[i],
             }
             for i in range(args.shard_count)
         ],
