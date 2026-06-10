@@ -56,7 +56,14 @@ S3_BUCKET = "petadex"
 # "default"/"none" omits the sensitivity flag entirely → DIAMOND's default (fast)
 # mode, which is distinct from (and slower than) --fast.
 SENSITIVITY = os.environ.get("DIAMOND_SENSITIVITY", "--very-sensitive").strip()
-BLOCK_SIZE = os.environ.get("DIAMOND_BLOCK_SIZE", "1")   # -b; Check 5: 0.5–1
+# -b reference-block size (Check 5: 0.5–1 for the index-bearing .dmnd path).
+# ⚠️ For the zstd/FASTA-as-DB path, -b must be large enough that the WHOLE shard
+# is a SINGLE reference block: with --dbsize the count is skipped (sequences: 0),
+# so multi-block runs emit per-block top-k with no global merge and OVER-REPORT
+# (doc 06 / CLAUDE.md §9.1). The build pipeline shards finely (~1 G letters) so
+# that -b1 already yields one block at ~1.9 GB RSS — keep shard letters <= one
+# block at this -b, or raise -b (which raises RSS, possibly onto the 10 GB tier).
+BLOCK_SIZE = os.environ.get("DIAMOND_BLOCK_SIZE", "1")
 # Lambda allocates ~1 vCPU per 1769 MB; os.cpu_count() reflects that.
 THREADS = int(os.environ.get("DIAMOND_THREADS", os.cpu_count() or 2))
 # Search-flag overrides for the Search Optimization 07 benchmarks (Benjamin
@@ -107,18 +114,35 @@ s3 = boto3.client(
 )
 
 
+# Manual-test fallback only: when no shardKey is supplied, reconstruct one from
+# version + index. Production ALWAYS passes the authoritative shardKey from the
+# manifest, so the pad width/suffix here never bind in production — they are
+# env-overridable for finer-shard / zstd manual tests rather than hardcoded.
+SHARD_PAD_WIDTH = int(os.environ.get("SHARD_PAD_WIDTH", "3"))
+SHARD_SUFFIX = os.environ.get("SHARD_SUFFIX", ".dmnd")  # ".dmnd" | ".fasta.zst"
+
+
 def resolve_shard_key(event):
-    """Return the exact S3 key of the shard .dmnd for this worker."""
+    """Return the exact S3 key of this worker's shard artifact."""
     key = event.get("shardKey")
     if key:
         return key
-    # Fallback for manual testing: reconstruct from version + index. Uses the
-    # build script's default zero-pad (width = digits in shard_count-1). When
-    # shard_count is unknown we cannot know the width, so require shardKey in
-    # production; this branch assumes the common 20-shard / width-2 layout.
     version = event["version"]
     idx = int(event["shardIndex"])
-    return f"diamond/{version}/shard_{idx:02d}.dmnd"
+    return f"diamond/{version}/shard_{idx:0{SHARD_PAD_WIDTH}d}{SHARD_SUFFIX}"
+
+
+def shard_db_path(shard_key, local_path):
+    """The path to pass to `diamond -d` for a downloaded shard.
+
+    `.dmnd`: DIAMOND appends the `.dmnd` suffix itself, so strip it.
+    Compressed FASTA (`.fasta.zst`/`.fa.zst`/`.fa.gz`/`.fa`): DIAMOND reads the
+    file directly as the DB (zstd needs the WITH_ZSTD=ON build), so pass it
+    verbatim. See doc 06 / CLAUDE.md for the zstd-as-DB path.
+    """
+    if shard_key.endswith(".dmnd"):
+        return local_path[:-len(".dmnd")]
+    return local_path
 
 
 def is_fasta_db(path):
