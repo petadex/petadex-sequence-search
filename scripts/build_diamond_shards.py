@@ -109,22 +109,27 @@ def shard_for(record_index, partition, shard_count, shard_size):
 
 
 def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
-                         max_records=None):
+                         max_records=None, local_path=None):
     """Single streaming pass: split the corpus into SHARD_COUNT FASTA files.
 
-    Reads the S3 body in STREAM_CHUNK slices and splits on b"\\n>" record
-    boundaries (the leading '>' of the very first record has no preceding
-    newline, so it is handled explicitly). The trailing fragment of each chunk
-    is held back as `leftover` until the next chunk completes it.
+    Reads the S3 body (or a local file if local_path is set) in STREAM_CHUNK
+    slices and splits on b"\\n>" record boundaries (the leading '>' of the very
+    first record has no preceding newline, so it is handled explicitly). The
+    trailing fragment of each chunk is held back as `leftover` until the next
+    chunk completes it.
 
     Returns (per-shard sequence counts, total records, per-shard residue counts).
     The residue counts are summed cheaply during this pass (count non-newline
     bytes after each record's header line) so the zstd path has per-shard
     `letters` for the manifest without a `diamond dbinfo` (it builds no `.dmnd`).
     """
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    obj_size = obj["ContentLength"]
-    body = obj["Body"]
+    if local_path:
+        obj_size = os.path.getsize(local_path)
+        body = open(local_path, "rb")
+    else:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        obj_size = obj["ContentLength"]
+        body = obj["Body"]
     shard_size = math.ceil(CORPUS_COUNT / shard_count)
 
     counts = [0] * shard_count
@@ -194,6 +199,8 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
     finally:
         for h in handles:
             h.close()
+        if local_path:
+            body.close()
 
     print()  # finish the progress line
     print(f"  partitioned {record_index:,} records in {time.time() - t0:.0f}s")
@@ -352,6 +359,11 @@ def main():
                     help="SMOKE TEST: stop after N records (a truncated, "
                          "non-publishable DB). Requires --skip-upload or "
                          "--no-bump-latest so it can never bump LATEST.")
+    ap.add_argument("--local-corpus", metavar="PATH", default=None,
+                    help="read the corpus FASTA from a local file instead of "
+                         "streaming from S3 (avoids S3 GET cost and bandwidth; "
+                         "partition logic is identical). --key is still used for "
+                         "the manifest corpus field.")
     args = ap.parse_args()
 
     # A --max-records run produces a truncated corpus; never let it become the
@@ -385,7 +397,10 @@ def main():
     print("=" * 64)
     print("PETadex DIAMOND shard builder (Phase 1)")
     print("=" * 64)
-    print(f"corpus      s3://{args.bucket}/{args.key}")
+    if args.local_corpus:
+        print(f"corpus      {args.local_corpus}  (local file; manifest records s3://{args.bucket}/{args.key})")
+    else:
+        print(f"corpus      s3://{args.bucket}/{args.key}")
     print(f"version     {version}")
     print(f"format      {args.format}"
           + (f"  (zstd level {args.zstd_level})" if args.format == "zstd" else ""))
@@ -449,7 +464,7 @@ def main():
     print(f"\n[1/4] Streaming corpus and partitioning into {args.shard_count} shards...")
     counts, total, counted_letters = stream_and_partition(
         s3, args.bucket, args.key, fasta_paths, args.partition, args.shard_count,
-        max_records=args.max_records)
+        max_records=args.max_records, local_path=args.local_corpus)
     for i, c in enumerate(counts):
         print(f"  shard_{i:0{width}d}: {c:,} seqs / {counted_letters[i]:,} letters "
               f"({human(fasta_paths[i].stat().st_size)} FASTA)")
