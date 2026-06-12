@@ -89,6 +89,15 @@ MASKING = os.environ.get("DIAMOND_MASKING", "").strip()
 # the per-shard `letters` threaded in the event (`shardLetters`); this env is
 # only the fallback when that figure is absent (e.g. a pre-letters manifest).
 FASTA_BLOCK_SIZE = os.environ.get("DIAMOND_FASTA_BLOCK_SIZE", "6")
+# DEV-BUILD ONLY override. When set (>0), forces this exact `-b` on the FASTA-as-DB
+# path, bypassing the single-block `fasta_block_size()` sizing. Exists solely to
+# exercise Benjamin's cross-block-merge fix (diamond_dev `dev`@4b2ae056) at `-b1`
+# on Lambda — the fix makes multi-block top-k merge correctly, so the single-block
+# requirement no longer applies and `-b1` (~2 GB RSS) replaces the OOM-prone `-b4`.
+# ⚠️ MUST stay UNSET on the production worker: the prod 2.2.1 build OVER-REPORTS at
+# `-b1` (no merge → per-block top-k; doc 06/08). Default "" → prod behavior unchanged.
+# See doc "08 Compressed-FASTA Merge Dev Build Validation" Stage 2.
+FASTA_BLOCK_OVERRIDE = os.environ.get("DIAMOND_FASTA_BLOCK_OVERRIDE", "").strip()
 _FASTA_SUFFIXES = (".fa.zst", ".fa.gz", ".fasta.gz", ".fasta.zst", ".fa", ".fasta")
 # Effective reference-DB size (residues) for e-value calibration. Normally
 # threaded from the manifest via the event (`dbSize`); this env is a manual
@@ -167,7 +176,17 @@ def fasta_block_size(shard_letters):
     it to the shard — rather than a fixed `-b6` — is what lets finer shards fit
     Lambda's 10 GiB tier: 20 shards (~5.25 Gletters -> -b6) OOMs, 32 shards
     (~3.28 Gletters -> -b4) fits. Falls back to DIAMOND_FASTA_BLOCK_SIZE when the
-    letter count is unknown (a manifest/event without per-shard `letters`)."""
+    letter count is unknown (a manifest/event without per-shard `letters`).
+
+    DEV-BUILD escape hatch: DIAMOND_FASTA_BLOCK_OVERRIDE (when >0) wins outright —
+    forces that `-b` regardless of shard letters, so the dev build can be tested at
+    `-b1`. Unset in production, so the single-block sizing below is unchanged."""
+    if FASTA_BLOCK_OVERRIDE:
+        try:
+            if int(FASTA_BLOCK_OVERRIDE) > 0:
+                return FASTA_BLOCK_OVERRIDE
+        except (TypeError, ValueError):
+            pass
     try:
         n = int(shard_letters)
     except (TypeError, ValueError):

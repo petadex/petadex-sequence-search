@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.4
+#
+# Dockerfile.dev — DEV-BUILD worker image for doc "08 Compressed-FASTA Merge Dev
+# Build Validation" Stages 2–4. IDENTICAL to ./Dockerfile except the DIAMOND step:
+# instead of the tagged v2.2.1 release tarball, it builds diamond_dev `dev`@<SHA>
+# (Benjamin's cross-block-merge fix) WITH_ZSTD=ON. Everything else — base image,
+# MMseqs2, Python deps, handlers — is byte-identical so the ONLY variable under
+# test is the DIAMOND binary.
+#
+# ⚠️ This image is for a THROWAWAY function (petadex-diamond-worker-devtest) only.
+#    Never tag it `:latest` or point prod petadex-diamond-worker at it. It pins an
+#    unpinned private dev branch — not shippable (cutover waits for a tagged release).
+#
+# BUILD (BuildKit required for --mount=type=secret; arm64/Graviton box):
+#   echo -n "$GH_PAT" > /tmp/gh_token        # PAT/deploy-token with read on bbuchfink/diamond_dev
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.dev \
+#     --secret id=gh_token,src=/tmp/gh_token \
+#     --build-arg DIAMOND_DEV_SHA=4b2ae056851d28585ec7d3067ebaaaebdc7fbaac \
+#     -t <ecr>/petadex-mmseq2-search:devtest-4b2ae05 .
+#   shred -u /tmp/gh_token
+
+FROM public.ecr.aws/lambda/python:3.11
+
+# Build deps. Same as prod, plus `git` (prod fetches a tarball with wget; the dev
+# build clones a private repo). cmake3 (not cmake) per prod note; sqlite-devel +
+# libzstd-devel are mandatory for WITH_ZSTD.
+RUN yum install -y wget tar gzip git gcc gcc-c++ python3-devel cmake3 make zlib-devel \
+      sqlite-devel libzstd-devel
+
+# Install MMseqs2 (arm64) — unchanged from prod (legacy single-Lambda path).
+RUN wget https://mmseqs.com/latest/mmseqs-linux-arm64.tar.gz && \
+    tar xvzf mmseqs-linux-arm64.tar.gz && \
+    cp mmseqs/bin/* /usr/local/bin/ && \
+    rm -rf mmseqs mmseqs-linux-arm64.tar.gz
+RUN mmseqs version
+
+# ---- DIAMOND: dev build (the ONLY difference vs ./Dockerfile) -----------------
+# Clone the PRIVATE diamond_dev and check out the pinned dev SHA, then build from
+# source — DIAMOND ships no arm64 binary, so this compiles natively on Graviton
+# (NEON auto-detected). WITH_ZSTD=ON + explicit -DZSTD_LIBRARY so `.fa.zst` opens.
+#
+# The git token is a BuildKit secret mounted only for this RUN — it is never an
+# ARG/ENV and never written to a persisted layer. The clone dir (whose .git/config
+# briefly holds the tokened URL) is rm'd in the SAME layer, so nothing leaks.
+ARG DIAMOND_DEV_SHA=4b2ae056851d28585ec7d3067ebaaaebdc7fbaac
+RUN --mount=type=secret,id=gh_token \
+    GH_TOKEN="$(cat /run/secrets/gh_token)" && \
+    git clone "https://x-access-token:${GH_TOKEN}@github.com/bbuchfink/diamond_dev.git" diamond_dev && \
+    git -C diamond_dev checkout "${DIAMOND_DEV_SHA}" && \
+    test "$(git -C diamond_dev rev-parse HEAD)" = "${DIAMOND_DEV_SHA}" && \
+    cmake3 -S diamond_dev -B diamond-build -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so && \
+    cmake3 --build diamond-build -j "$(nproc)" && \
+    cp diamond-build/diamond /usr/local/bin/ && \
+    rm -rf diamond_dev diamond-build
+# Sanity: prints "diamond version 2.2.1" (same string as prod; carries the fix).
+RUN diamond version
+# ------------------------------------------------------------------------------
+
+# Python deps + function code + handler — all identical to ./Dockerfile.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
+
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}
+COPY common.py ${LAMBDA_TASK_ROOT}
+COPY worker.py ${LAMBDA_TASK_ROOT}
+COPY orchestrator.py ${LAMBDA_TASK_ROOT}
+COPY aggregator.py ${LAMBDA_TASK_ROOT}
+COPY cli.py ${LAMBDA_TASK_ROOT}
+RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
+
+CMD ["lambda_function.handler"]
