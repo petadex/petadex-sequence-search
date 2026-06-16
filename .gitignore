@@ -227,3 +227,11 @@ job_id:*
 
 # Documentation
 /docs/*
+
+# Pre-staged dev source for Dockerfile.dev (doc 08) — never commit
+/diamond_dev/
+# Generated A/B benchmark output (doc 08 Stage 3) — kept on disk, not committed
+scripts/stage3_ab_results.json
+
+# macOS
+.DS_Store

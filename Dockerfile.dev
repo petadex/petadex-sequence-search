@@ -11,20 +11,24 @@
 #    Never tag it `:latest` or point prod petadex-diamond-worker at it. It pins an
 #    unpinned private dev branch — not shippable (cutover waits for a tagged release).
 #
-# BUILD (BuildKit required for --mount=type=secret; arm64/Graviton box):
-#   echo -n "$GH_PAT" > /tmp/gh_token        # PAT/deploy-token with read on bbuchfink/diamond_dev
+# BUILD (arm64/Graviton box; source pre-staged, no token needed):
+#   git clone https://github.com/bbuchfink/diamond_dev.git diamond_dev   # your creds
+#   git -C diamond_dev checkout 4b2ae056851d28585ec7d3067ebaaaebdc7fbaac
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.dev \
-#     --secret id=gh_token,src=/tmp/gh_token \
 #     --build-arg DIAMOND_DEV_SHA=4b2ae056851d28585ec7d3067ebaaaebdc7fbaac \
 #     -t <ecr>/petadex-mmseq2-search:devtest-4b2ae05 .
-#   shred -u /tmp/gh_token
+# (Or just: ./scripts/stage2_devtest_runbook.sh build — it verifies the SHA first.)
 
 FROM public.ecr.aws/lambda/python:3.11
 
 # Build deps. Same as prod, plus `git` (prod fetches a tarball with wget; the dev
 # build clones a private repo). cmake3 (not cmake) per prod note; sqlite-devel +
 # libzstd-devel are mandatory for WITH_ZSTD.
-RUN yum install -y wget tar gzip git gcc gcc-c++ python3-devel cmake3 make zlib-devel \
+# gcc10/gcc10-c++ (Amazon Linux 2 amzn2-core): the base image's default GCC 7.3.1
+# cannot compile diamond_dev `dev` — it uses C++17 `std::pmr::string`, absent from
+# 7.3.1's libstdc++. GCC 10.5 has it. The binary is statically linked against
+# gcc10's libstdc++ (below) so it still runs on the 7.3.1 runtime.
+RUN yum install -y wget tar gzip git gcc gcc-c++ gcc10 gcc10-c++ python3-devel cmake3 make zlib-devel \
       sqlite-devel libzstd-devel
 
 # Install MMseqs2 (arm64) — unchanged from prod (legacy single-Lambda path).
@@ -35,24 +39,36 @@ RUN wget https://mmseqs.com/latest/mmseqs-linux-arm64.tar.gz && \
 RUN mmseqs version
 
 # ---- DIAMOND: dev build (the ONLY difference vs ./Dockerfile) -----------------
-# Clone the PRIVATE diamond_dev and check out the pinned dev SHA, then build from
-# source — DIAMOND ships no arm64 binary, so this compiles natively on Graviton
-# (NEON auto-detected). WITH_ZSTD=ON + explicit -DZSTD_LIBRARY so `.fa.zst` opens.
+# Build diamond_dev `dev`@<SHA> from source — DIAMOND ships no arm64 binary, so
+# this compiles natively on Graviton (NEON auto-detected). WITH_ZSTD=ON + explicit
+# -DZSTD_LIBRARY so `.fa.zst` opens.
 #
-# The git token is a BuildKit secret mounted only for this RUN — it is never an
-# ARG/ENV and never written to a persisted layer. The clone dir (whose .git/config
-# briefly holds the tokened URL) is rm'd in the SAME layer, so nothing leaks.
+# Source is PRE-STAGED on the build host: you `git clone` the private diamond_dev
+# (with your own GitHub creds) into ./diamond_dev and check out the pinned SHA,
+# then it is COPY'd in here — no in-build clone, no git token, no BuildKit secret.
+# The SHA is re-verified against the COPY'd tree's .git so provenance still binds.
+# Toolchain notes (compile with gcc10, NOT the base 7.3.1):
+#   -DCMAKE_C/CXX_COMPILER=gcc10-*  : 10.5 has C++17 std::pmr (7.3.1 does not).
+#   -DCMAKE_CXX_FLAGS=-include memory_resource : file.h uses std::pmr::string but
+#       only #includes <string>; <string> forward-declares std::pmr::string yet
+#       leaves polymorphic_allocator INCOMPLETE without <memory_resource>. Force-
+#       including it globally completes the type with ZERO source edits (provenance
+#       stays bound to dev@SHA) and reproduces the cluster Gate-1 binary's real
+#       std::pmr path (not the in-tree fallback shim).
+#   -static-libstdc++ -static-libgcc : the runtime image only ships 7.3.1's
+#       libstdc++ (no pmr symbols); static-linking gcc10's avoids a load-time
+#       GLIBCXX_* miss. Verified: ldd shows no dynamic libstdc++.
 ARG DIAMOND_DEV_SHA=4b2ae056851d28585ec7d3067ebaaaebdc7fbaac
-RUN --mount=type=secret,id=gh_token \
-    GH_TOKEN="$(cat /run/secrets/gh_token)" && \
-    git clone "https://x-access-token:${GH_TOKEN}@github.com/bbuchfink/diamond_dev.git" diamond_dev && \
-    git -C diamond_dev checkout "${DIAMOND_DEV_SHA}" && \
-    test "$(git -C diamond_dev rev-parse HEAD)" = "${DIAMOND_DEV_SHA}" && \
-    cmake3 -S diamond_dev -B diamond-build -DCMAKE_BUILD_TYPE=Release \
-      -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so && \
-    cmake3 --build diamond-build -j "$(nproc)" && \
-    cp diamond-build/diamond /usr/local/bin/ && \
-    rm -rf diamond_dev diamond-build
+COPY diamond_dev/ /tmp/diamond_dev/
+RUN test "$(git -C /tmp/diamond_dev rev-parse HEAD)" = "${DIAMOND_DEV_SHA}" && \
+    cmake3 -S /tmp/diamond_dev -B /tmp/diamond-build -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so \
+      -DCMAKE_C_COMPILER=gcc10-gcc -DCMAKE_CXX_COMPILER=gcc10-g++ \
+      -DCMAKE_CXX_FLAGS="-include memory_resource" \
+      -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" && \
+    cmake3 --build /tmp/diamond-build -j "$(nproc)" && \
+    cp /tmp/diamond-build/diamond /usr/local/bin/ && \
+    rm -rf /tmp/diamond_dev /tmp/diamond-build
 # Sanity: prints "diamond version 2.2.1" (same string as prod; carries the fix).
 RUN diamond version
 # ------------------------------------------------------------------------------

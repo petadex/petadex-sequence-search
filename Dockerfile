@@ -31,13 +31,33 @@ RUN mmseqs version
 # -DZSTD_LIBRARY points at the shared lib explicitly — DIAMOND's CMake otherwise
 # only auto-searches for the static `.a`.
 ARG DIAMOND_VERSION=2.2.1
-RUN wget -O diamond.tar.gz \
-      https://github.com/bbuchfink/diamond/archive/refs/tags/v${DIAMOND_VERSION}.tar.gz && \
-    tar xzf diamond.tar.gz && \
-    cmake3 -S diamond-${DIAMOND_VERSION} -B diamond-build -DCMAKE_BUILD_TYPE=Release \
-      -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so && \
-    cmake3 --build diamond-build -j "$(nproc)" && \
-    cp diamond-build/diamond /usr/local/bin/ && \
+# Toolchain selector for the zstd-on-merge-fix CUTOVER (doc "08 Compressed-FASTA
+# Merge Dev Build Validation"). Default "base" = today's build, byte-for-byte
+# (GCC 7.3.1). Set to "gcc10" ONLY if a bumped DIAMOND_VERSION fails to compile
+# with `'std::pmr' has not been declared` — the cross-block-merge source uses
+# C++17 std::pmr, absent from the base image's 7.3.1 libstdc++. The gcc10 path
+# (proven on dev@4b2ae056) installs GCC 10.5, force-includes <memory_resource>
+# so std::pmr resolves, and STATIC-links libstdc++/libgcc so the binary still
+# runs on the 7.3.1 runtime. Toggle at build time:
+#   docker build --build-arg DIAMOND_VERSION=<tag> --build-arg DIAMOND_BUILD_TOOLCHAIN=gcc10
+ARG DIAMOND_BUILD_TOOLCHAIN=base
+RUN set -eu; \
+    wget -O diamond.tar.gz \
+      "https://github.com/bbuchfink/diamond/archive/refs/tags/v${DIAMOND_VERSION}.tar.gz"; \
+    tar xzf diamond.tar.gz; \
+    if [ "$DIAMOND_BUILD_TOOLCHAIN" = "gcc10" ]; then \
+      yum install -y gcc10 gcc10-c++; \
+      cmake3 -S diamond-${DIAMOND_VERSION} -B diamond-build -DCMAKE_BUILD_TYPE=Release \
+        -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so \
+        -DCMAKE_C_COMPILER=gcc10-gcc -DCMAKE_CXX_COMPILER=gcc10-g++ \
+        -DCMAKE_CXX_FLAGS="-include memory_resource" \
+        -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"; \
+    else \
+      cmake3 -S diamond-${DIAMOND_VERSION} -B diamond-build -DCMAKE_BUILD_TYPE=Release \
+        -DWITH_ZSTD=ON -DZSTD_LIBRARY=/usr/lib64/libzstd.so; \
+    fi; \
+    cmake3 --build diamond-build -j "$(nproc)"; \
+    cp diamond-build/diamond /usr/local/bin/; \
     rm -rf diamond.tar.gz diamond-${DIAMOND_VERSION} diamond-build
 
 # Verify DIAMOND installation
