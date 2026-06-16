@@ -98,6 +98,18 @@ FASTA_BLOCK_SIZE = os.environ.get("DIAMOND_FASTA_BLOCK_SIZE", "6")
 # `-b1` (no merge → per-block top-k; doc 06/08). Default "" → prod behavior unchanged.
 # See doc "08 Compressed-FASTA Merge Dev Build Validation" Stage 2.
 FASTA_BLOCK_OVERRIDE = os.environ.get("DIAMOND_FASTA_BLOCK_OVERRIDE", "").strip()
+# CUTOVER flag (doc 08 Phase E). When truthy, declares the deployed DIAMOND binary
+# MERGES top-k correctly across reference blocks (the diamond_dev cross-block-merge
+# fix — validated end-to-end: Gate 1 + Stage 3). That LIFTS the single-reference-
+# block requirement for a FASTA-as-DB, so the worker runs `-b1` — the lowest-RSS,
+# fits-Lambda config (2.84 GB measured) — regardless of shard size, instead of
+# sizing one block to the whole shard (which forced -b4 → OOM on the unfixed build).
+# This is the principled PROD replacement for the dev-only DIAMOND_FASTA_BLOCK_OVERRIDE
+# benchmark hack: set DIAMOND_FASTA_CROSSBLOCK_MERGE=1 once a merge-fixed DIAMOND
+# release is pinned. ⚠️ MUST stay UNSET on the stock 2.2.1 build — it OVER-REPORTS at
+# multi-block -b1 (no merge → per-block top-k; doc 06/08).
+CROSSBLOCK_MERGE = os.environ.get("DIAMOND_FASTA_CROSSBLOCK_MERGE", "").strip().lower() \
+    not in ("", "0", "false", "no", "none")
 _FASTA_SUFFIXES = (".fa.zst", ".fa.gz", ".fasta.gz", ".fasta.zst", ".fa", ".fasta")
 # Effective reference-DB size (residues) for e-value calibration. Normally
 # threaded from the manifest via the event (`dbSize`); this env is a manual
@@ -180,13 +192,21 @@ def fasta_block_size(shard_letters):
 
     DEV-BUILD escape hatch: DIAMOND_FASTA_BLOCK_OVERRIDE (when >0) wins outright —
     forces that `-b` regardless of shard letters, so the dev build can be tested at
-    `-b1`. Unset in production, so the single-block sizing below is unchanged."""
+    `-b1`. Unset in production, so the single-block sizing below is unchanged.
+
+    CUTOVER path: DIAMOND_FASTA_CROSSBLOCK_MERGE (truthy) declares the binary merges
+    top-k across blocks, lifting the single-block requirement → `-b1` for ANY shard
+    size (lowest RSS, fits Lambda). This is the production setting once a merge-fixed
+    DIAMOND release is pinned; until then the single-block sizing below stands."""
     if FASTA_BLOCK_OVERRIDE:
         try:
             if int(FASTA_BLOCK_OVERRIDE) > 0:
                 return FASTA_BLOCK_OVERRIDE
         except (TypeError, ValueError):
             pass
+    # Merge-fixed binary: no single-block constraint → minimal -b = minimal RSS.
+    if CROSSBLOCK_MERGE:
+        return "1"
     try:
         n = int(shard_letters)
     except (TypeError, ValueError):
