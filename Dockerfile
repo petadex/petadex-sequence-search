@@ -25,12 +25,15 @@ RUN mmseqs version
 # Install DIAMOND (sharded scale-out engine). DIAMOND ships only x86-64 release
 # binaries — there is no prebuilt arm64/aarch64 download — so we build from
 # source. Fast natively; slower under QEMU emulation in CI but fine.
-# v2.2.1 (bumped from 2.1.11): adds compressed-FASTA-as-DB read support; built
-# WITH_ZSTD=ON so a `.fa.zst` shard works as `-d`. The `.dmnd` path is
-# behaviorally identical to 2.1.11 (result-identity verified at deploy).
+# v2.2.2 (bumped from 2.2.1): carries the compressed-FASTA cross-block top-k
+# merge fix, so a `.fa.zst` shard searches correctly at `-b1` across multiple
+# reference blocks (set DIAMOND_FASTA_CROSSBLOCK_MERGE=1 on the worker). Built
+# WITH_ZSTD=ON so a `.fa.zst` shard works as `-d`. Re-validated on the devtest
+# harness (doc "09 v2.2.2 Release Cutover" — byte-identical to the dev build,
+# hitset_sig e9964fb0fbd1b0c0); the `.dmnd` path is unaffected by the FASTA fix.
 # -DZSTD_LIBRARY points at the shared lib explicitly — DIAMOND's CMake otherwise
 # only auto-searches for the static `.a`.
-ARG DIAMOND_VERSION=2.2.1
+ARG DIAMOND_VERSION=2.2.2
 # Toolchain selector for the zstd-on-merge-fix CUTOVER (doc "08 Compressed-FASTA
 # Merge Dev Build Validation"). Default "base" = today's build, byte-for-byte
 # (GCC 7.3.1). Set to "gcc10" ONLY if a bumped DIAMOND_VERSION fails to compile
