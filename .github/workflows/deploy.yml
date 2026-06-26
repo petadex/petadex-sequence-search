@@ -7,8 +7,8 @@ on:
 
 env:
   AWS_REGION: us-east-1
+  # Shared ECR repo (historically named for MMseqs2; now serves the DIAMOND image).
   ECR_REPOSITORY: petadex-mmseq2-search
-  LAMBDA_FUNCTION: petadex-mmseqs2-search
 
 permissions:
   contents: write # for tagging
@@ -74,21 +74,12 @@ jobs:
             --push \
             .
 
-      - name: Update Lambda function
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ needs.version.outputs.new_tag }}
-        run: |
-          aws lambda update-function-code \
-            --function-name $LAMBDA_FUNCTION \
-            --image-uri $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      # NOTE: the legacy `petadex-mmseqs2-search` function is no longer deployed
+      # here (Phase 7 decouple, 2026-06-26). MMseqs2 was removed from the image,
+      # so shipping this image to it would break it; it stays frozen on its last
+      # MMseqs2-bearing image. The web app is on the DIAMOND orchestrator.
 
-      - name: Wait for Lambda update to complete
-        run: |
-          aws lambda wait function-updated \
-            --function-name $LAMBDA_FUNCTION
-
-      # --- DIAMOND scale-out (transition; additive — legacy above is untouched) ---
+      # --- DIAMOND scale-out: the only deploy targets now ---
       # Updates CODE only on the three handlers that share this image. The
       # functions + state machine are provisioned once by
       # scripts/provision_diamond_infra.sh; these steps no-op (with a notice)

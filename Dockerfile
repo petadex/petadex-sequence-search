@@ -11,16 +11,12 @@ FROM public.ecr.aws/lambda/python:3.11
 RUN yum install -y wget tar gzip gcc gcc-c++ python3-devel cmake3 make zlib-devel \
       sqlite-devel libzstd-devel
 
-# Install MMseqs2 (arm64 for Apple Silicon & AWS Graviton).
-# KEPT during the DIAMOND transition — the legacy single-Lambda search path
-# still uses it. Remove in Phase 7 cutover.
-RUN wget https://mmseqs.com/latest/mmseqs-linux-arm64.tar.gz && \
-    tar xvzf mmseqs-linux-arm64.tar.gz && \
-    cp mmseqs/bin/* /usr/local/bin/ && \
-    rm -rf mmseqs mmseqs-linux-arm64.tar.gz
-
-# Verify MMseqs2 installation
-RUN mmseqs version
+# MMseqs2 REMOVED (Phase 7 decouple, 2026-06-26). The web app is on the DIAMOND
+# orchestrator (legacy petadex-mmseqs2-search is retired), so the image no longer
+# ships the MMseqs2 binary. This also removes the build's dependency on
+# mmseqs.com, whose intermittent 503s were failing the deploy. The legacy
+# function (if ever invoked) stays frozen on its last MMseqs2-bearing image —
+# deploy.yml no longer ships this image to it.
 
 # Install DIAMOND (sharded scale-out engine). DIAMOND ships only x86-64 release
 # binaries — there is no prebuilt arm64/aarch64 download — so we build from
@@ -82,8 +78,10 @@ COPY cli.py ${LAMBDA_TASK_ROOT}
 # Make cli.py executable
 RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
 
-# Default handler: the legacy MMseqs2 search Lambda. One image serves multiple
-# roles — the DIAMOND worker Lambda overrides this CMD to `worker.handler`
-# (and the future orchestrator to its own handler) via function config.
+# Default handler: the DIAMOND worker. One image serves all DIAMOND roles —
+# each function overrides this CMD via ImageConfig.Command (orchestrator →
+# `orchestrator.handler`, aggregator → `aggregator.handler`); the worker uses
+# this default. The legacy `lambda_function.py` is still copied above (inert —
+# nothing invokes it now that MMseqs2 is removed) pending full Phase 7 removal.
 # Override with: docker run --entrypoint python3 image cli.py
-CMD ["lambda_function.handler"]
+CMD ["worker.handler"]
