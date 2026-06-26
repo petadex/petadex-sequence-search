@@ -24,16 +24,17 @@
 #   IMAGE_URI       Full ECR image URI (default: <acct>.dkr.ecr.<region>.amazonaws.com/petadex-mmseq2-search:latest)
 #   VPC_SUBNET_IDS  Comma-separated subnet IDs for the aggregator (to reach RDS).
 #   VPC_SG_IDS      Comma-separated security group IDs for the aggregator.
-#   WORKER_RESERVED_CONCURRENCY  Default 160. Each job's Map fans out
+#   WORKER_RESERVED_CONCURRENCY  Default 200. Each job's Map fans out
 #       SHARD_COUNT (32) workers at once, each holding its slot for its whole
 #       download+search, so this must sit *above* peak demand with margin — NOT
 #       equal to it. Setting it to exactly N_jobs × 32 (e.g. 96 for the deploy's
 #       3-example regen) leaves almost zero headroom: burst/packing jitter
 #       throttles a few workers, the Map's short (~14s) throttle-retry can't
 #       outwait a multi-minute slot hold, and the retries cascade into more
-#       throttles → fail-fast (the §10.6 storm). 160 absorbs the 3-job (96-worker)
-#       regen burst with 64 slots to spare and supports ~5 concurrent searches.
-#       (Was 100 at SHARD_COUNT=20; raised with the 20→32 reshard, §10.13.)
+#       throttles → fail-fast (the §10.6 storm). 200 absorbs the 3-job (96-worker)
+#       regen burst with ~104 slots to spare (~3 extra concurrent searches).
+#       (Was 100 at SHARD_COUNT=20; 160 is the safe min at 32; 200 chosen for
+#       extra headroom at the 2.2.2 zstd cutover, §10.13 / doc 09.)
 #       Reserved-but-idle slots aren't billed.
 #
 # The aggregator reaches RDS exactly as the legacy function does. If that
@@ -46,7 +47,7 @@ ACCOUNT_ID="${ACCOUNT_ID:?set ACCOUNT_ID to your 12-digit AWS account ID}"
 REGION="${AWS_REGION:-us-east-1}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-petadex-mmseq2-search}"
 IMAGE_URI="${IMAGE_URI:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPOSITORY}:latest}"
-WORKER_RESERVED_CONCURRENCY="${WORKER_RESERVED_CONCURRENCY:-160}"
+WORKER_RESERVED_CONCURRENCY="${WORKER_RESERVED_CONCURRENCY:-200}"
 
 ORCH_FN="petadex-diamond-orchestrator"
 WORKER_FN="petadex-diamond-worker"
