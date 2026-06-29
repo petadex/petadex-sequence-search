@@ -25,7 +25,11 @@ import re
 #
 #   1.0.0 — DIAMOND blastp, default (fast) sensitivity, -b 1, full-corpus
 #           --dbsize e-value calibration. (Initial versioned release.)
-SEARCH_VERSION = "1.0.0"
+#   1.1.0 — No functional/result change. Version-bump to validate that a
+#           code-only deploy lands cleanly on the functions and the
+#           search/version stamping flows through end-to-end (post-MMseqs2
+#           decouple). Busts the cache (all queries re-run, identical results).
+SEARCH_VERSION = "1.1.0"
 
 
 def parse_database_release(corpus):
