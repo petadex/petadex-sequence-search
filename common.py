@@ -29,7 +29,18 @@ import re
 #           code-only deploy lands cleanly on the functions and the
 #           search/version stamping flows through end-to-end (post-MMseqs2
 #           decouple). Busts the cache (all queries re-run, identical results).
-SEARCH_VERSION = "1.1.0"
+#   1.2.0 — Expanded input acceptance: full IUPAC ambiguity codes (B, J, Z, X,
+#           U, O) now accepted; stop codons (*) and gap chars (-) silently
+#           stripped before search. Previously-rejected sequences now succeed;
+#           cache bust warranted.
+SEARCH_VERSION = "1.2.0"
+
+# Valid amino acid characters accepted by the search pipeline.
+# Includes the 20 standard AAs plus IUPAC ambiguity codes DIAMOND handles natively.
+# Stop codons (*) and gap characters (-) are stripped before this check.
+VALID_AA = set("ACDEFGHIKLMNPQRSTVWYBJZXUO")
+MIN_LEN = 10
+MAX_LEN = 10_000
 
 
 def parse_database_release(corpus):
@@ -52,33 +63,50 @@ def parse_database_release(corpus):
 
 
 def parse_fasta(raw):
-    """Parse a FASTA string into (header, sequence). Also accepts bare sequence."""
+    """Parse a FASTA string into (header, sequence). Also accepts bare sequence.
+
+    Raises ValueError for multi-FASTA input (multiple > records); only single
+    sequences are supported by the DIAMOND fan-out architecture.
+    """
     raw = raw.strip()
     if raw.startswith(">"):
         lines = raw.splitlines()
+        header_count = sum(1 for line in lines if line.startswith(">"))
+        if header_count > 1:
+            raise ValueError(
+                "Multi-FASTA input is not supported — please submit a single sequence."
+            )
         header = lines[0][1:].strip()  # strip leading '>'
         sequence = "".join(lines[1:])
     else:
-        header = None
+        header = "query"
         sequence = raw
     return header, sequence
 
 
 def validate_sequence(sequence):
-    """Validate input protein sequence; return the cleaned uppercase sequence."""
+    """Validate input protein sequence; return the cleaned uppercase sequence.
+
+    Strips stop codons (*) and gap characters (-) silently before validation.
+    Accepts the full IUPAC ambiguity set (B, J, Z, X, U, O) in addition to
+    the 20 standard amino acids.
+    """
     # Remove whitespace and newlines
     sequence = "".join(sequence.split())
 
-    # Check valid amino acids
-    valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
-    if not all(c in valid_aa for c in sequence.upper()):
+    # Strip stop codons and gap characters — not residues, but legal in pasted
+    # translated ORFs and aligned sequences; DIAMOND should not receive them.
+    sequence = sequence.replace("*", "").replace("-", "")
+
+    # Check valid amino acids (standard 20 + IUPAC ambiguity codes)
+    if not all(c in VALID_AA for c in sequence.upper()):
         raise ValueError("Invalid amino acid characters in sequence")
 
-    # Check length
-    if len(sequence) < 10:
-        raise ValueError("Sequence too short (minimum 10 amino acids)")
+    # Check length on the cleaned body (after stop/gap stripping)
+    if len(sequence) < MIN_LEN:
+        raise ValueError(f"Sequence too short (minimum {MIN_LEN} amino acids)")
 
-    if len(sequence) > 10000:
-        raise ValueError("Sequence too long (maximum 10,000 amino acids)")
+    if len(sequence) > MAX_LEN:
+        raise ValueError(f"Sequence too long (maximum {MAX_LEN:,} amino acids)")
 
     return sequence.upper()

@@ -133,30 +133,43 @@ def download_database():
 
 
 def parse_fasta(raw):
-    """Parse a FASTA string into (header, sequence). Also accepts bare sequence."""
+    """Parse a FASTA string into (header, sequence). Also accepts bare sequence.
+
+    Inline copy — keep in sync with common.py until Phase 7 cutover.
+    """
     raw = raw.strip()
     if raw.startswith(">"):
         lines = raw.splitlines()
+        header_count = sum(1 for line in lines if line.startswith(">"))
+        if header_count > 1:
+            raise ValueError(
+                "Multi-FASTA input is not supported — please submit a single sequence."
+            )
         header = lines[0][1:].strip()  # strip leading '>'
         sequence = "".join(lines[1:])
     else:
-        header = None
+        header = "query"
         sequence = raw
     return header, sequence
 
 
 def validate_sequence(sequence):
-    """Validate input protein sequence"""
+    """Validate input protein sequence; return the cleaned uppercase sequence.
 
+    Inline copy — keep in sync with common.py until Phase 7 cutover.
+    """
     # Remove whitespace and newlines
     sequence = "".join(sequence.split())
 
-    # Check valid amino acids
-    valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
+    # Strip stop codons and gap characters silently
+    sequence = sequence.replace("*", "").replace("-", "")
+
+    # Check valid amino acids (standard 20 + IUPAC ambiguity codes)
+    valid_aa = set("ACDEFGHIKLMNPQRSTVWYBJZXUO")
     if not all(c in valid_aa for c in sequence.upper()):
         raise ValueError("Invalid amino acid characters in sequence")
 
-    # Check length
+    # Check length on cleaned body
     if len(sequence) < 10:
         raise ValueError("Sequence too short (minimum 10 amino acids)")
 
