@@ -91,13 +91,13 @@
       "Next": "RecordSessionError"
     },
     "RecordSessionError": {
-      "Comment": "Negative signal: native S3 PutObject (NO Lambda) to results/{sessionId}.error so the backend poller reports status:failed well before the client timeout, instead of spinning. Keyed on sessionId (the only path the poller knows) — never jobId. Native S3 (not a Lambda writer) so it survives the throttle storm that would also throttle any Lambda. Runs BEFORE RecordFailureTiming so the sentinel is written even if the timing rollup fails; either way the job still ends as JobFailed (a Fail state), keeping CloudWatch/alarms honest. Requires s3:PutObject on results/* in the state-machine role.",
+      "Comment": "Negative signal: native S3 PutObject (NO Lambda) to results/{sessionId}.error so the backend poller reports status:failed well before the client timeout, instead of spinning. Keyed on sessionId (the only path the poller knows) — never jobId. Native S3 (not a Lambda writer) so it survives the throttle storm that would also throttle any Lambda. Runs BEFORE RecordFailureTiming so the sentinel is written even if the timing rollup fails; either way the job still ends as JobFailed (a Fail state), keeping CloudWatch/alarms honest. Requires s3:PutObject on results/* in the state-machine role. Body is the $.errorSignal object passed DIRECTLY (not States.JsonToString, which double-encodes the body into a quoted JSON string) so the .error file is clean single-encoded JSON — verified live 2026-07-07.",
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "petadex",
         "Key.$": "States.Format('results/{}.error', $.sessionId)",
-        "Body.$": "States.JsonToString($.errorSignal)",
+        "Body.$": "$.errorSignal",
         "ContentType": "application/json"
       },
       "ResultPath": "$.sentinelResult",
