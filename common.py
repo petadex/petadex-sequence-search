@@ -33,7 +33,14 @@ import re
 #           U, O) now accepted; stop codons (*) and gap chars (-) silently
 #           stripped before search. Previously-rejected sequences now succeed;
 #           cache bust warranted.
-SEARCH_VERSION = "1.2.0"
+#   1.3.0 — Hits now carry the target amino-acid sequence: the worker requests
+#           DIAMOND's `full_sseq` column and the aggregator stamps it as
+#           `target_sequence` on every hit. The HIT SET is unchanged (same
+#           query + corpus -> same targets, scores and ranking) — but the cached
+#           payload is not, so this MUST bump: without it the web app would keep
+#           serving pre-1.3.0 cached results that have no sequences, which is
+#           exactly the staleness the cache key exists to prevent.
+SEARCH_VERSION = "1.3.0"
 
 # Valid amino acid characters accepted by the search pipeline.
 # Includes the 20 standard AAs plus IUPAC ambiguity codes DIAMOND handles natively.

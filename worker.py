@@ -120,8 +120,17 @@ DBSIZE_ENV = os.environ.get("DIAMOND_DBSIZE")
 # the legacy MMseqs2 field order (target, qstart, qend, tstart, tend, alnlen,
 # ident, evalue, bits) so the merge logic stays uniform — except `pident` here
 # is already 0–100 (see module docstring).
+#
+# `full_sseq` (the FULL target protein, not just the aligned segment) is APPENDED
+# LAST, deliberately: the aggregator reads columns positionally, so a trailing
+# column is backward-compatible — a part written by an older worker simply has 9
+# columns and yields `target_sequence: None` instead of breaking the merge. Hits
+# are the only place the residues can come from cheaply: the corpus FASTA is
+# 116 GB and unindexed by ORF ID, so a post-hoc lookup in the aggregator is not
+# viable, whereas DIAMOND already holds the subject sequence in the reference
+# block it just searched. Costs ~1 sequence-worth of TSV per hit (≈50 rows/shard).
 OUTFMT = ["6", "sseqid", "qstart", "qend", "sstart", "send",
-          "length", "pident", "evalue", "bitscore"]
+          "length", "pident", "evalue", "bitscore", "full_sseq"]
 
 # Mirror the multipart tuning the legacy download path uses.
 S3_DOWNLOAD_CONCURRENCY = 32

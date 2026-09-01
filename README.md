@@ -138,7 +138,7 @@ results/{sessionId}/{jobId}/parts/shard_N.meta.json# per-shard timing sidecar
 results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 ```
 
-The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
+The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
 
 Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
 
@@ -214,6 +214,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `percent_identity` | float | Percent identical residues over the alignment, **0–100** (DIAMOND's native scale; never re-scaled — see Scoring & e-values). |
 | `evalue` | float | Expectation value, calibrated against the **full corpus** (not the local shard) via `--dbsize`. |
 | `bitscore` | float | DIAMOND bit-score. **Primary ranking key.** |
+| `target_sequence` | string \| null | **Full amino-acid sequence of the matched target** (DIAMOND's `full_sseq`) — the complete subject protein, not just the aligned segment, so it is typically longer than `alignment_length`. Added in `search_version` 1.3.0; `null` only for a hit merged from a part written by an older worker. |
 | `metadata` | object \| null | RDS-enriched annotation; `null` when the target has no RDS match (the usual case for Logan ORF IDs — see below). |
 
 Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both query and target.

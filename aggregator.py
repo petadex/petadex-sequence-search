@@ -84,7 +84,12 @@ def read_parts(session_id, job_id):
     """Read + parse every shard part TSV into result dicts.
 
     DIAMOND outfmt-6 column order (set by the worker):
-        sseqid qstart qend sstart send length pident evalue bitscore
+        sseqid qstart qend sstart send length pident evalue bitscore full_sseq
+
+    `full_sseq` (column 10) is the FULL target protein sequence, appended last by
+    the worker so this parser stays backward-compatible: a part written by an
+    older worker has only 9 columns and yields `target_sequence: None` rather
+    than failing the merge (which, under fail-fast, would fail the whole job).
     """
     prefix = f"results/{session_id}/{job_id}/parts/"
     paginator = s3.get_paginator("list_objects_v2")
@@ -116,6 +121,9 @@ def read_parts(session_id, job_id):
                     "percent_identity": pident,
                     "evalue": float(p[7]),
                     "bitscore": float(p[8]),
+                    # Full target amino-acid sequence (DIAMOND `full_sseq`).
+                    # None for parts written by a pre-full_sseq worker.
+                    "target_sequence": p[9] if len(p) > 9 else None,
                 })
     return results, n_parts
 
