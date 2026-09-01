@@ -6,7 +6,8 @@ The final state of the Step Functions Map execution. It runs ONLY after every
 shard branch has succeeded (fail-fast: any worker failure makes the Map Catch
 abort the execution before this state), so all `parts/shard_*.tsv` are present.
 
-It merges the per-shard partial TSVs, ranks globally, truncates to maxResults,
+It merges the per-shard partial TSVs, ranks globally, truncates to the job's
+search depth (`maxResults` in the execution input = common.RESULT_DEPTH),
 enriches from RDS once, and writes the result in the UNCHANGED shape the web app
 already consumes — `results/{sessionId}/{jobId}.json` + `results/{sessionId}.index`.
 
@@ -300,6 +301,14 @@ def handler(event, context):
         "query_sequence": query_sequence,
         "query_length": len(query_sequence),
         "num_results": len(results),
+        # Depth this job SEARCHED to (not the caller's display count, which no
+        # longer reaches the search). Stamped from the value actually used, so
+        # a result stays honest about itself if the constant changes later.
+        # The web app serves any display count <= this from cache and re-runs
+        # only for a deeper request; `num_results < result_depth` means the
+        # e-value floor was reached first, i.e. the search was exhaustive and
+        # every display count is servable. See common.RESULT_DEPTH.
+        "result_depth": max_results,
         # Corpus identity (additive fields; the web app ignores unknown keys).
         # These make a result self-identifying as the DIAMOND/Logan 300M path —
         # `engine: diamond`, the corpus FASTA, the version, and the full DB seq

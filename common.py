@@ -40,7 +40,41 @@ import re
 #           payload is not, so this MUST bump: without it the web app would keep
 #           serving pre-1.3.0 cached results that have no sequences, which is
 #           exactly the staleness the cache key exists to prevent.
-SEARCH_VERSION = "1.3.0"
+#   1.4.0 — Result count decoupled from the search: every job now searches to a
+#           fixed server-side RESULT_DEPTH (below) and the caller's
+#           `max_results` becomes purely presentational (the web app subsets at
+#           view time). Same query + corpus -> the same ranked hits, but the
+#           stored payload now holds RESULT_DEPTH rows instead of the caller's
+#           count, so this MUST bump: without it a cached 50-hit result would
+#           keep being served to a request that asks for 200.
+SEARCH_VERSION = "1.4.0"
+
+# Depth of the SEARCH itself — how many hits every job computes and stores,
+# regardless of how many the caller asks to display. Set once here, injected by
+# the orchestrator into the execution input, and used unchanged downstream as
+# the worker's per-shard `-k` and the aggregator's final truncation.
+#
+# WHY A CONSTANT, not the caller's `max_results`: `max_results` used to be both
+# a search parameter AND a cache-key input, so changing the displayed count
+# re-ran the entire 32-shard fan-out (~46 s, 32 Lambdas) to surface rows the
+# previous job had already computed and discarded at the truncation step. The
+# fan-out's cost is fixed (shard download + seed-index rebuild) and is
+# essentially independent of `-k`, so it is far cheaper to search deep ONCE and
+# let the web app slice. See the vault note "12 Variable Result Count".
+#
+# WHY 500: it is exactly the cap the web app's request schema already allows
+# (`max_results` Joi max(500)), so making it the fixed depth means no query
+# becomes less capable than it is today. It is a CEILING, not a quota — the
+# worker passes no `--evalue`, so DIAMOND's default 1e-3 cutoff usually returns
+# fewer hits than this anyway (`num_results < result_depth` in a result means
+# the search was exhaustive and ANY display count is servable from it).
+#
+# Changing this value does NOT require a SEARCH_VERSION bump: every result
+# carries its own `result_depth`, so the web app re-runs only those queries
+# whose stored depth is too shallow for what is being asked. Never set it to 0
+# / unlimited — against a 307M-sequence corpus a promiscuous query would return
+# an unbounded payload, and since 1.3.0 every hit carries a full protein.
+RESULT_DEPTH = 500
 
 # Valid amino acid characters accepted by the search pipeline.
 # Includes the 20 standard AAs plus IUPAC ambiguity codes DIAMOND handles natively.
