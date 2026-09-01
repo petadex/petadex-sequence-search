@@ -138,7 +138,7 @@ results/{sessionId}/{jobId}/parts/shard_N.meta.json# per-shard timing sidecar
 results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 ```
 
-The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
+The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `result_depth`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
 
 Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
 
@@ -156,7 +156,7 @@ Both axes are needed because either one alone leaves a staleness hole: a corpus 
 **Cache key (web-app responsibility — now implemented).** The Express app (`petadex.io`) derives `sessionId` by hashing the query **plus both versions**, so a corpus or pipeline change produces a fresh key (cache miss → re-run) instead of serving a stale result. The live key is:
 
 ```
-sessionId = md5(cleanSequence + ":" + maxResults + ":" + database_version + ":" + search_version)
+sessionId = md5(cleanSequence + ":" + database_version + ":" + search_version)
 ```
 
 Use `database_version` (the precise build tag), not `database_release`, so the cache also invalidates on a same-release rebuild. The key was previously `hash(sequence)` only; folding in the versions re-keyed the entire prior keyspace at once (a one-time full cache miss), orphaning every pre-versioning result tree.
@@ -166,7 +166,8 @@ The key must encode the versions a *fresh* search **would** run with (current co
 ```jsonc
 // request:  { "action": "version" }   (no sessionId — it's what you call to BUILD one)
 // response: { "database_version": "catalytic_orfs_v1.1_20260602_222538",
-//             "database_release": "v1.1", "search_version": "1.0.0" }
+//             "database_release": "v1.1", "search_version": "1.4.0",
+//             "result_depth": 500 }
 ```
 
 The web app calls this (cache the response briefly), folds the two versions into `makeSessionId`, then does its normal index lookup. **The `makeSessionId` change lives in the Express web-app repo (`petadex.io`), not here** — this repo's job is to make the versions *self-describing* (stamped into every result) and *queryable* (the `version` action) so the key can be built. Re-keying orphans every prior cache entry; the orphaned `parts/` and `timing.json` are reaped by the `reapable=true` lifecycle rule (see [Cleanup & lifecycle](#cleanup--lifecycle)), while the small leftover `{jobId}.json` + `.index` are negligible.
@@ -192,7 +193,8 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `query_header` | string | User-supplied label identifying the search (free text; defaults to `query`). |
 | `query_sequence` | string | The input amino-acid sequence that was searched. |
 | `query_length` | int | Length of the query in residues. |
-| `num_results` | int | Number of hits returned (equals `len(results)`). |
+| `num_results` | int | Number of hits actually found and stored (equals `len(results)`). Capped by `result_depth`; when it is **less**, the e-value floor was reached first — the search was exhaustive. |
+| `result_depth` | int | **Depth this job searched to** — the per-shard `-k` and the final truncation limit (`RESULT_DEPTH` in [common.py](common.py)). A cached result can serve any display count up to this; a deeper request must re-run. Added in `search_version` 1.4.0. See [Result depth](#result-depth--variable-display-count). |
 | `engine` | string | Search engine — always `diamond` on this path. |
 | `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
 | `database_release` | string \| null | **Human-facing corpus version**, e.g. `v1.1` (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
@@ -285,6 +287,32 @@ A side-car rollup written **beside** the result (not inside it), so it survives 
 A shard whose worker died before writing its sidecar appears as `{ "shard_index": i, "status": "missing" }` rather than being dropped.
 
 **Notes from observed data.** Shards are near-perfectly even — every shard holds 15,357,787–15,357,788 sequences and ~6.017 GB, confirming the round-robin partition balances both seq count and residues (20 × ~15.357M = the 307,155,746 corpus total). Per-shard `download_ms` is uniform (~77–78 s, the Lambda network ceiling), so the `fastest_slowest_spread_ms` comes entirely from `search_ms`, which clusters into two bands (~29 s and ~37–38 s). The bimodality is not explained by sequence count (identical across shards) and is attributed to **Lambda vCPU allocation variance** (cold-vs-warm CPU) — a known, benign source of the ~9–10 s spread.
+
+### Result depth & variable display count
+
+Every job searches to a **fixed server-side depth** — `RESULT_DEPTH` in [common.py](common.py), currently **500** — regardless of how many hits the caller asks to display. The request's `max_results` is accepted (the contract is unchanged) but is **presentational only**: it never reaches DIAMOND, never changes what is stored, and is **not part of the cache key**.
+
+**Why.** `max_results` used to be both a search parameter (`-k` per shard, then the aggregator's truncation) *and* a cache-key input. So changing a displayed count produced a different `sessionId` → cache miss → a full 32-shard fan-out (~46 s, 32 Lambda invocations) to surface rows the previous job had **already computed and discarded** at the truncation step. The fan-out's cost is fixed — shard download plus seed-index rebuild — and is essentially independent of `-k`, so searching deep once and subsetting at view time is far cheaper than re-searching.
+
+**The subset is exact, not an approximation.** Per-shard `-k K` followed by a global merge yields the true global top-K (a hit in the global top-K necessarily ranks at least as high within its own shard), and that invariant holds for **every N ≤ K**. The first N rows of a stored depth-K result are identical to what a fresh `max_results=N` search would have produced.
+
+**Depth is a ceiling, not a quota.** The worker passes no `--evalue`, so DIAMOND's default `1e-3` cutoff applies — and full-corpus `--dbsize` calibration makes e-values *less* significant than a per-shard run would, so that cutoff usually bites first. Most queries return fewer hits than `RESULT_DEPTH`.
+
+**How a consumer uses it.** Every result stamps `result_depth` alongside `num_results`:
+
+| Observation | Meaning |
+|---|---|
+| `requested N <= result_depth` | Serve from cache — slice the stored `results[]` to N. |
+| `requested N > result_depth` | **Cache miss** — re-run (the stored result is too shallow). |
+| `num_results < result_depth` | The e-value floor was reached first: the search was **exhaustive**, so *every* display count is servable from this result, forever. |
+
+The `version` action reports the depth a *fresh* search would use, so the app can make this decision before the cache lookup rather than reading it off a stale entry.
+
+> **Changing `RESULT_DEPTH` does not require a `SEARCH_VERSION` bump.** Because each result carries its own `result_depth`, raising the constant re-runs only those queries whose stored depth is too shallow, instead of busting the whole cache. (The 1.3.0 → 1.4.0 bump was needed for the one-time *switch* to fixed-depth searching, not for future depth changes.)
+>
+> **Never set it to 0 / unlimited.** Against a 307M-sequence corpus a promiscuous query would produce an unbounded payload — and since 1.3.0 every hit carries a full protein sequence (~586 B/hit, so ~293 KB at depth 500).
+
+**The display-side subsetting lives in `petadex.io`, not here** — this repo's job is to search deep, store the depth, and report it. ⚠️ In the Express app the slice must happen **before** `enrichWithFamilyData()`, otherwise that per-request Postgres round trip runs over the full stored depth instead of the displayed count.
 
 ### Cleanup & lifecycle
 
@@ -381,6 +409,8 @@ The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which
 }
 ```
 
+> `max_results` is accepted but **presentational only** — every job searches to the fixed `RESULT_DEPTH` (see [Result depth](#result-depth--variable-display-count)) and the caller subsets at view time. It is not part of the cache key and does not change what is searched or stored.
+
 Response:
 ```json
 {
@@ -418,7 +448,8 @@ Response:
 {
   "database_version": "catalytic_orfs_v1.1_20260602_222538",
   "database_release": "v1.1",
-  "search_version": "1.0.0"
+  "search_version": "1.4.0",
+  "result_depth": 500
 }
 ```
 

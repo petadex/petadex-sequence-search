@@ -15,6 +15,12 @@ from `common.py`.
 Event (web-app contract, unchanged):
     { "action": "search", "sessionId": "...", "sequence": "...", "max_results": 50 }
     { "action": "history", "sessionId": "..." }
+    { "action": "version" }
+
+NOTE `max_results` is still accepted but is now PRESENTATIONAL only — every job
+searches to the fixed `common.RESULT_DEPTH` and the web app subsets at view
+time, so changing a display count no longer re-runs the fan-out. See
+common.RESULT_DEPTH.
 
 Search response (unchanged):
     { "job_id": "<uuid>", "s3_key": "results/{sessionId}/{jobId}.json" }
@@ -43,7 +49,8 @@ from datetime import datetime, timezone
 
 import boto3
 
-from common import SEARCH_VERSION, parse_database_release, parse_fasta, validate_sequence
+from common import (RESULT_DEPTH, SEARCH_VERSION, parse_database_release,
+                    parse_fasta, validate_sequence)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 DIAMOND_PREFIX = "diamond"
@@ -172,6 +179,11 @@ def get_versions(requested=None):
     returns them (read it before reusing a cached sessionId; see the README
     "Versioning & cache invalidation" section).
 
+    Also returns `result_depth` — the depth a fresh search would run to — which
+    the app needs for the same decision: a cached result serves any display
+    count up to its own stamped `result_depth` and is re-run only for a deeper
+    one. `max_results` is NOT part of the cache key.
+
     Cheap: one `LATEST` GET + one `manifest.json` GET (the app should cache the
     response briefly rather than calling per request). `requested` pins a version
     for testing, mirroring `resolve_version`.
@@ -182,6 +194,11 @@ def get_versions(requested=None):
         "database_version": version,                       # precise build tag
         "database_release": db_meta.get("databaseRelease"),  # human label (v1.1)
         "search_version": SEARCH_VERSION,                  # search-pipeline semver
+        # Depth a FRESH search would run to. The web app needs this BEFORE the
+        # cache-hit decision: a cached result can serve any display count up to
+        # its own stamped `result_depth`, and must be re-run only for a deeper
+        # request. `max_results` is no longer part of the cache key.
+        "result_depth": RESULT_DEPTH,
     }
 
 
@@ -248,7 +265,17 @@ def handler(event, context):
 
         # --- search ---
         raw_input = body.get("sequence", "").strip()
-        max_results = int(body.get("max_results", 50))
+        # The caller's `max_results` is accepted (the request contract is
+        # unchanged) but deliberately does NOT reach the search: every job runs
+        # to the fixed RESULT_DEPTH and the web app subsets at view time. This
+        # is what lets a display-count change be a free re-render instead of a
+        # fresh 32-shard fan-out — see common.RESULT_DEPTH and the vault note
+        # "12 Variable Result Count".
+        requested_display = body.get("max_results")
+        max_results = RESULT_DEPTH
+        if requested_display is not None:
+            print(f"max_results={requested_display} is presentational; "
+                  f"searching to RESULT_DEPTH={RESULT_DEPTH}")
 
         # Measure the orchestrator's own phases and thread them into the execution
         # input so the aggregator records them in timing.json (symmetric to its
