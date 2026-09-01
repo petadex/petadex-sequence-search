@@ -12,6 +12,15 @@ out and we isolate search), then interleaved arms so drift hits every arm
 equally. Timings are read from the worker's own `TIMING` log lines via
 `--log-type Tail`, plus Lambda's REPORT line for billed duration and peak RSS.
 
+Artifacts: the worker hardcodes its part key as `results/{sessionId}/{jobId}/
+parts/...`, so a benchmark's scratch parts land in the live results area whether
+we want them or not. This script therefore ARCHIVES them when it finishes —
+moving them under `diamond/benchmarks/result-depth/` and stripping the
+`reapable=true` tag the worker sets. Both halves matter: the bucket's
+`reap-search-parts` lifecycle rule is scoped to that TAG with no prefix filter,
+so a moved-but-still-tagged object is deleted after 14 days regardless of where
+it now lives. `--no-archive` leaves them in `results/` to expire normally.
+
     python3 scripts/bench_result_depth.py --depths 50 250 500 --runs 3
 """
 import argparse
@@ -96,6 +105,35 @@ def invoke(shard, query_fasta, depth, db_size, session):
     }
 
 
+def archive_artifacts(session, dest_prefix):
+    """Move this run's worker parts out of results/ and into the benchmark area.
+
+    The worker writes `results/{sessionId}/{jobId}/parts/*` tagged
+    `reapable=true`. We relocate them under `dest_prefix` and drop the tag
+    (`TaggingDirective="REPLACE"` with no Tagging = no tags), because the
+    `reap-search-parts` lifecycle rule matches on that tag alone — a relocated
+    object that keeps it still disappears in 14 days.
+    """
+    src = f"results/{session}/"
+    moved = total_bytes = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=src):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            dest = dest_prefix.rstrip("/") + "/" + key[len(src):]
+            s3.copy_object(Bucket=BUCKET, Key=dest,
+                           CopySource={"Bucket": BUCKET, "Key": key},
+                           TaggingDirective="REPLACE")   # no Tagging => untagged
+            s3.delete_object(Bucket=BUCKET, Key=key)
+            moved += 1
+            total_bytes += obj["Size"]
+    if moved:
+        print(f"\narchived {moved} artifact(s) ({total_bytes:,} B) -> "
+              f"s3://{BUCKET}/{dest_prefix.rstrip('/')}/ (untagged, will not be reaped)")
+    else:
+        print(f"\nno artifacts found under s3://{BUCKET}/{src}")
+    return moved
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--depths", type=int, nargs="+", default=[50, 250, 500])
@@ -106,6 +144,10 @@ def main():
     ap.add_argument("--version", default=None)
     ap.add_argument("--session", default="benchdepth")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--archive-prefix", default="diamond/benchmarks/result-depth",
+                    help="where to move this run's worker parts when it finishes")
+    ap.add_argument("--no-archive", action="store_true",
+                    help="leave parts in results/ (they expire via the reapable tag)")
     a = ap.parse_args()
 
     version = a.version or resolve_version()
@@ -163,6 +205,9 @@ def main():
     if a.out:
         json.dump(out, open(a.out, "w"), indent=2)
         print(f"\nwrote {a.out}")
+
+    if not a.no_archive:
+        archive_artifacts(a.session, f"{a.archive_prefix}/{a.session}")
 
 
 if __name__ == "__main__":
