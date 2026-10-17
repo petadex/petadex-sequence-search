@@ -4,10 +4,10 @@ This directory contains scripts for building and uploading the PETadex sequence 
 
 ## Files
 
-- **[update_sequence_index.py](update_sequence_index.py)** - (MMseqs2, legacy) extracts sequences from PostgreSQL, builds MMseqs2 database, and uploads to `mmseqs2/`
-- **[build_diamond_shards.py](build_diamond_shards.py)** - (DIAMOND, scale-out) streams the full Logan corpus FASTA from S3, builds the sharded DIAMOND database, and publishes it to `diamond/`
-- **[striped_corpus_sample.py](striped_corpus_sample.py)** - Phase 0 pre-build sampler used to size SHARD_COUNT
-- **[setup_s3_access.sh](setup_s3_access.sh)** - Script to create IAM user with limited S3 permissions
+- **[update_sequence_index.py](db/update_sequence_index.py)** - (MMseqs2, legacy) extracts sequences from PostgreSQL, builds MMseqs2 database, and uploads to `mmseqs2/`
+- **[build_diamond_shards.py](db/build_diamond_shards.py)** - (DIAMOND, scale-out) streams the full Logan corpus FASTA from S3, builds the sharded DIAMOND database, and publishes it to `diamond/`
+- **[striped_corpus_sample.py](db/striped_corpus_sample.py)** - Phase 0 pre-build sampler used to size SHARD_COUNT
+- **[setup_s3_access.sh](deploy/setup_s3_access.sh)** - Script to create IAM user with limited S3 permissions
 - **[S3_SETUP.md](S3_SETUP.md)** - Detailed documentation for S3 access setup
 - **[requirements.txt](requirements.txt)** - Python dependencies
 
@@ -17,7 +17,7 @@ This directory contains scripts for building and uploading the PETadex sequence 
 
 ```bash
 # Run the automated setup script
-./scripts/setup_s3_access.sh
+./scripts/deploy/setup_s3_access.sh
 
 # Or see S3_SETUP.md for manual setup and other options
 ```
@@ -52,10 +52,10 @@ export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxx"
 
 ```bash
 # Build and upload to S3
-./scripts/update_sequence_index.py
+./scripts/db/update_sequence_index.py
 
 # Or build locally only (for testing)
-./scripts/update_sequence_index.py --skip-s3
+./scripts/db/update_sequence_index.py --skip-s3
 ```
 
 ## Usage Examples
@@ -64,7 +64,7 @@ export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxx"
 
 ```bash
 # Build database locally without uploading
-./scripts/update_sequence_index.py --skip-s3
+./scripts/db/update_sequence_index.py --skip-s3
 
 # Check the generated files
 ls -lh /tmp/enzyme_fastaa_mmseqs_*
@@ -74,10 +74,10 @@ ls -lh /tmp/enzyme_fastaa_mmseqs_*
 
 ```bash
 # Build and upload to default bucket (petadex-sequence-db)
-./scripts/update_sequence_index.py
+./scripts/db/update_sequence_index.py
 
 # Upload to custom bucket
-./scripts/update_sequence_index.py --bucket my-custom-bucket
+./scripts/db/update_sequence_index.py --bucket my-custom-bucket
 ```
 
 ### Use with Docker
@@ -93,7 +93,7 @@ docker run --rm \
   -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
   soedinglab/mmseqs2 \
-  python /scripts/update_sequence_index.py
+  python /scripts/db/update_sequence_index.py
 ```
 
 ## What Happens
@@ -131,19 +131,19 @@ pip install -r scripts/requirements.txt          # boto3
 # diamond: download the arm64 binary from https://github.com/bbuchfink/diamond
 
 # Full build → upload → bump LATEST (the real Phase 1 artifact):
-./scripts/build_diamond_shards.py --scratch-dir /mnt/scratch
+./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch
 
 # Dry run (prints the plan, touches nothing):
-./scripts/build_diamond_shards.py --dry-run
+./scripts/db/build_diamond_shards.py --dry-run
 
 # Build + upload a version WITHOUT publishing it (inspect before going live):
-./scripts/build_diamond_shards.py --scratch-dir /mnt/scratch --no-bump-latest
+./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch --no-bump-latest
 # ...then publish once verified:
 aws s3api put-object --bucket petadex --key diamond/LATEST \
   --body <(printf '%s' catalytic_orfs_v1.1_YYYYMMDD_HHMMSS)
 
 # Build locally only, no S3 writes at all (e.g. on a scratch box):
-./scripts/build_diamond_shards.py --scratch-dir /mnt/scratch --skip-upload
+./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch --skip-upload
 ```
 
 Key flags: `--partition {round-robin,contiguous}` (default `round-robin` — even

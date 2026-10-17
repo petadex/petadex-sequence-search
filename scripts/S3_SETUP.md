@@ -10,8 +10,8 @@ Create an IAM user that can ONLY upload to the S3 bucket:
 
 ```bash
 # Run the setup script
-chmod +x scripts/setup_s3_access.sh
-./scripts/setup_s3_access.sh
+chmod +x scripts/deploy/setup_s3_access.sh
+./scripts/deploy/setup_s3_access.sh
 ```
 
 This creates:
@@ -27,7 +27,7 @@ export AWS_ACCESS_KEY_ID="AKIAxxxxxxxxx"
 export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxx"
 
 # Run database update
-python scripts/update_sequence_index.py
+python scripts/db/update_sequence_index.py
 ```
 
 ### Option 2: Manual Setup
@@ -204,7 +204,7 @@ jobs:
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
-          python scripts/update_sequence_index.py
+          python scripts/db/update_sequence_index.py
 ```
 
 ## Database Update Script
@@ -245,13 +245,13 @@ export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxx"
 
 ```bash
 # Build and upload to S3
-python scripts/update_sequence_index.py
+python scripts/db/update_sequence_index.py
 
 # Build locally only (for testing)
-python scripts/update_sequence_index.py --skip-s3
+python scripts/db/update_sequence_index.py --skip-s3
 
 # Use different bucket
-python scripts/update_sequence_index.py --bucket my-custom-bucket
+python scripts/db/update_sequence_index.py --bucket my-custom-bucket
 ```
 
 ### What It Does

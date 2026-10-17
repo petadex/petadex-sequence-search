@@ -68,12 +68,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
 
 # Copy function code
-COPY lambda_function.py ${LAMBDA_TASK_ROOT}
-COPY common.py ${LAMBDA_TASK_ROOT}
-COPY worker.py ${LAMBDA_TASK_ROOT}
-COPY orchestrator.py ${LAMBDA_TASK_ROOT}
-COPY aggregator.py ${LAMBDA_TASK_ROOT}
-COPY cli.py ${LAMBDA_TASK_ROOT}
+# Lambda code lives in src/ but is copied FLAT into the task root, so handler
+# names stay `worker.handler` / `orchestrator.handler` / `aggregator.handler`.
+COPY src/*.py ${LAMBDA_TASK_ROOT}/
 
 # Make cli.py executable
 RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py

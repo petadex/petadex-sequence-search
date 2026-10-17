@@ -60,7 +60,7 @@ for _n in "$DEVTEST_FN" "$AGG_DEVTEST_FN"; do
 done
 
 phase="${1:-}"; [ -n "$phase" ] || { sed -n '2,30p' "$0"; exit 1; }
-HERE="$(cd "$(dirname "$0")/.." && pwd)"         # repo root (Dockerfile.dev lives here)
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"      # repo root (build context; Dockerfile.dev is in docker/)
 
 # ---- build (r6g arm64 box) --------------------------------------------------
 build() {
@@ -89,7 +89,7 @@ build() {
     | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
   echo ">> building $IMAGE_URI from Dockerfile.dev (dev@$DEV_SHA, arm64, source pre-staged)"
-  DOCKER_BUILDKIT=1 docker build -f "$HERE/Dockerfile.dev" \
+  DOCKER_BUILDKIT=1 docker build -f "$HERE/docker/Dockerfile.dev" \
     --build-arg DIAMOND_DEV_SHA="$DEV_SHA" \
     --provenance=false \
     -t "$IMAGE_URI" "$HERE"
@@ -192,7 +192,7 @@ fanout() {
   command -v python3 >/dev/null || { echo "FATAL: python3 not found"; exit 2; }
   echo ">> Stage-3 fan-out arm=$arm (aggregator=$AGG_DEVTEST_FN)"
   python3 "$(dirname "$0")/stage3_fanout.py" --arm "$arm" \
-    --aggregator-fn "$AGG_DEVTEST_FN" --seqs-file "$HERE/example-sequences.txt" \
+    --aggregator-fn "$AGG_DEVTEST_FN" --seqs-file "$HERE/data/example-sequences.txt" \
     ${COLD:+--cold}
 }
 
@@ -209,7 +209,7 @@ ab() {
 # ---- invoke (Stage 2: cold -b1 RSS read; run twice for the variance check) --
 invoke() {
   local seq stamp ev out
-  seq=$(awk '/^>IsPETase/{f=1;next} /^>/{f=0} f{printf "%s",$0}' "$HERE/example-sequences.txt")
+  seq=$(awk '/^>IsPETase/{f=1;next} /^>/{f=0} f{printf "%s",$0}' "$HERE/data/example-sequences.txt")
   [ -n "$seq" ] || { echo "FATAL: could not extract IsPETase from example-sequences.txt"; exit 2; }
   stamp="devtest-$(date +%s)"
   ev=$(python3 -c '

@@ -58,8 +58,8 @@ SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SM_NAME}"
 
 : "${DB_SECRET_ARN:?set DB_SECRET_ARN to the RDS credentials secret ARN}"
 
-IAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../infra/iam" && pwd)"
-ASL_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../infra" && pwd)/search_state_machine.asl.json"
+IAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra/iam" && pwd)"
+ASL_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra" && pwd)/search_state_machine.asl.json"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

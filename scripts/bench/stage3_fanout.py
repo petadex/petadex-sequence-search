@@ -231,7 +231,7 @@ def main():
     ap.add_argument("--aggregator-fn", default="petadex-diamond-aggregator-devtest")
     ap.add_argument("--query-name", default="IsPETase")
     ap.add_argument("--seqs-file", default=None,
-                    help="example-sequences.txt path (default: ../example-sequences.txt)")
+                    help="example-sequences.txt path (default: <repo>/data/example-sequences.txt)")
     ap.add_argument("--max-results", type=int, default=50)
     ap.add_argument("--max-parallel", type=int, default=32)
     ap.add_argument("--worker", default=None, help="override the arm's worker function")
@@ -241,7 +241,7 @@ def main():
 
     import os
     seqs_file = args.seqs_file or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "example-sequences.txt")
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "example-sequences.txt")
 
     arm = ARMS[args.arm]
     worker_fn = args.worker or arm["worker"]

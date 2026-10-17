@@ -130,9 +130,9 @@ jobs:
           POLL_TIMEOUT_S = 840
           POLL_INTERVAL_S = 15
 
-          # Parse example-sequences.txt
+          # Parse data/example-sequences.txt
           examples = []
-          with open('example-sequences.txt') as f:
+          with open('data/example-sequences.txt') as f:
               current_header, current_seq = None, []
               for line in f:
                   line = line.rstrip()

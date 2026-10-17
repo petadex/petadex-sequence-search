@@ -157,7 +157,7 @@ Permissions:
 Usage:
   export AWS_ACCESS_KEY_ID="${ACCESS_KEY_ID}"
   export AWS_SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY}"
-  python scripts/update_sequence_index.py
+  python scripts/db/update_sequence_index.py
 
 IMPORTANT: Store these credentials securely!
 These credentials CANNOT be retrieved again after this screen is closed.
@@ -185,5 +185,5 @@ echo "  1. Save the credentials from ${CREDS_FILE}"
 echo "  2. Set environment variables:"
 echo "     export AWS_ACCESS_KEY_ID=\"${ACCESS_KEY_ID}\""
 echo "     export AWS_SECRET_ACCESS_KEY=\"${SECRET_ACCESS_KEY}\""
-echo "  3. Run: python scripts/update_sequence_index.py"
+echo "  3. Run: python scripts/db/update_sequence_index.py"
 echo ""

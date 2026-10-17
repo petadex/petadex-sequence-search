@@ -1,24 +1,8 @@
 # Publishing PETadex Search to GitHub
 
-## 📦 Complete Repo Structure Created
+## 📦 Repo Structure
 
-```
-petadex-search/
-├── lambda_function.py              # Lambda handler with S3 result storage
-├── cli.py                          # Standalone CLI entrypoint
-├── Dockerfile                      # Multi-mode container (Lambda + CLI)
-├── requirements.txt                # Python dependencies
-├── README.md                       # Comprehensive documentation
-├── .gitignore                      # Git ignore file
-├── .github/
-│   └── workflows/
-│       ├── docker-publish.yml      # Auto-publish to Docker Hub
-│       └── update-database.yml.example  # Optional: auto database updates
-└── scripts/
-    ├── update_sequence_index.py    # Database update script
-    ├── setup_s3_access.sh          # S3 setup helper
-    └── README.md                   # Database documentation
-```
+See [Project Structure](../README.md#project-structure) in the main README for the current layout.
 
 ---
 

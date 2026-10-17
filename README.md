@@ -1,4 +1,10 @@
-# PETadex Sequence Search
+<p align="center">
+  <img src="assets/diamond-logo-web.png" alt="PETadex DIAMOND sequence search logo: a hand holding a diamond made of protein sequence, refracting light from a protein structure" width="280">
+</p>
+
+<h1 align="center">PETadex Sequence Search</h1>
+
+<p align="center"><b>DIAMOND-powered protein search across 307M Logan catalytic ORFs</b></p>
 
 > **Note: This is an internal component, not a standalone tool. It is designed to be invoked as an AWS Lambda function by the PETadex web application.**
 
@@ -34,7 +40,7 @@ The scale-out architecture replaces the single MMseqs2 Lambda with a **sharded, 
 | **Worker** (×20 in parallel) | `petadex-diamond-worker` | Downloads its assigned shard `.dmnd` to `/tmp` (cached across warm invocations, evicting any other shard first), runs `diamond blastp`, writes a raw outfmt-6 TSV part to S3. One worker per shard. |
 | **Aggregator** | `petadex-diamond-aggregator` | Merges all parts → sorts by bitscore desc / evalue asc → top-K → enriches from RDS once → writes the final result JSON + `.index` pointer in the unchanged schema. |
 
-All four share **one Docker image** (ARM64, DIAMOND built from source — no arm64 release binary exists); the Lambdas are distinguished by their `ImageConfig.Command` (`orchestrator.handler` / `worker.handler` / `aggregator.handler`). The legacy `mmseqs` binary remains in the image during the transition.
+All four share **one Docker image** (ARM64, DIAMOND built from source — no arm64 release binary exists); the Lambdas are distinguished by their `ImageConfig.Command` (`orchestrator.handler` / `worker.handler` / `aggregator.handler`). The `mmseqs` binary was removed from the image on 2026-06-26.
 
 ### Data flow
 
@@ -80,7 +86,7 @@ sequenceDiagram
 
 ### Sharded database on S3
 
-The corpus FASTA (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`) is streamed and split round-robin into 20 shards; each is built with `diamond makedb` into a `.dmnd` and uploaded. Built offline by `scripts/build_diamond_shards.py` (an arm64 box with ~300 GB scratch — not a laptop job).
+The corpus FASTA (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`) is streamed and split round-robin into 20 shards; each is built with `diamond makedb` into a `.dmnd` and uploaded. Built offline by `scripts/db/build_diamond_shards.py` (an arm64 box with ~300 GB scratch — not a laptop job).
 
 ```
 s3://petadex/diamond/
@@ -149,7 +155,7 @@ Every search is labelled by **two independent version axes**, both stamped into 
 | Axis | Result field(s) | What it tracks | Changes when |
 |---|---|---|---|
 | **Database** | `database_release` (`v1.1`, human label) + `database_version` (`catalytic_orfs_v1.1_20260602_222538`, precise build tag) | The corpus searched against. `database_release` is parsed from the corpus filename (`petadex.catalytic_orfs.v1.1.fa`) and labels every shard via the manifest; `database_version` pins the exact build. | The corpus is rebuilt/republished (new data, re-sharding) — `database_version` changes on *every* rebuild; `database_release` only on a semantic bump (`v1.1` → `v1.2`). |
-| **Search** | `search_version` (`1.0.0`, semver) | The search pipeline — engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus — e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, or a scoring change. |
+| **Search** | `search_version` (`1.0.0`, semver) | The search pipeline — engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](src/common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus — e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, or a scoring change. |
 
 Both axes are needed because either one alone leaves a staleness hole: a corpus bump invalidates results the database axis catches, but a pipeline change (same corpus, different sensitivity) is invisible to it — that's what `search_version` covers.
 
@@ -161,7 +167,7 @@ sessionId = md5(cleanSequence + ":" + database_version + ":" + search_version)
 
 Use `database_version` (the precise build tag), not `database_release`, so the cache also invalidates on a same-release rebuild. The key was previously `hash(sequence)` only; folding in the versions re-keyed the entire prior keyspace at once (a one-time full cache miss), orphaning every pre-versioning result tree.
 
-The key must encode the versions a *fresh* search **would** run with (current corpus + pipeline), so the web app needs to learn them *before* the cache-hit decision — not read them off a stale entry. `database_version` is `diamond/LATEST`, but `search_version` is a code constant (`SEARCH_VERSION` in [common.py](common.py)) that lives nowhere in S3. So the orchestrator exposes a stateless **`version` action** as the single source of truth:
+The key must encode the versions a *fresh* search **would** run with (current corpus + pipeline), so the web app needs to learn them *before* the cache-hit decision — not read them off a stale entry. `database_version` is `diamond/LATEST`, but `search_version` is a code constant (`SEARCH_VERSION` in [common.py](src/common.py)) that lives nowhere in S3. So the orchestrator exposes a stateless **`version` action** as the single source of truth:
 
 ```jsonc
 // request:  { "action": "version" }   (no sessionId — it's what you call to BUILD one)
@@ -176,7 +182,7 @@ The web app calls this (cache the response briefly), folds the two versions into
 
 The architecture is sound — two orthogonal axes, version pinned once per job, results self-describing. The exposure is in two **manual tripwires**, not the design:
 
-1. **`search_version` is hand-bumped — nothing couples it to the actual search parameters.** If a change to sensitivity, block size, scoring, or the engine is shipped without bumping `SEARCH_VERSION` in [common.py](common.py), the cache silently serves stale results for the same query — the exact failure this scheme exists to prevent, with no automated guard. Treat bumping `SEARCH_VERSION` as part of any change to the DIAMOND command or its calibration. (A hardening option: derive `search_version` from a hash of the live params — `engine|sensitivity|block_size|dbsize_mode` — so it cannot drift.)
+1. **`search_version` is hand-bumped — nothing couples it to the actual search parameters.** If a change to sensitivity, block size, scoring, or the engine is shipped without bumping `SEARCH_VERSION` in [common.py](src/common.py), the cache silently serves stale results for the same query — the exact failure this scheme exists to prevent, with no automated guard. Treat bumping `SEARCH_VERSION` as part of any change to the DIAMOND command or its calibration. (A hardening option: derive `search_version` from a hash of the live params — `engine|sensitivity|block_size|dbsize_mode` — so it cannot drift.)
 2. **The cache key depends on the live `version` action — and the web app's failure handling must reach a *unique* fallback.** The key's `database_version` comes from calling `version` before the cache-hit decision. If that lookup fails, the web app must fall back to a **per-request nonce** (forcing a clean miss), *not* an empty-version key — otherwise all failing requests collide on one `…::` key and can serve each other stale results. Note the orchestrator returns handled errors as `{statusCode, body:{error}}` with **no Lambda `FunctionError`**, so the web-app guard must treat a non-2xx envelope (or missing version fields) as failure, not just a thrown SDK error. (This guard lives in `petadex.io`.)
 
 Two benign properties, noted so they aren't mistaken for bugs:
@@ -194,7 +200,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `query_sequence` | string | The input amino-acid sequence that was searched. |
 | `query_length` | int | Length of the query in residues. |
 | `num_results` | int | Number of hits actually found and stored (equals `len(results)`). Capped by `result_depth`; when it is **less**, the e-value floor was reached first — the search was exhaustive. |
-| `result_depth` | int | **Depth this job searched to** — the per-shard `-k` and the final truncation limit (`RESULT_DEPTH` in [common.py](common.py)). A cached result can serve any display count up to this; a deeper request must re-run. Added in `search_version` 1.4.0. See [Result depth](#result-depth--variable-display-count). |
+| `result_depth` | int | **Depth this job searched to** — the per-shard `-k` and the final truncation limit (`RESULT_DEPTH` in [common.py](src/common.py)). A cached result can serve any display count up to this; a deeper request must re-run. Added in `search_version` 1.4.0. See [Result depth](#result-depth--variable-display-count). |
 | `engine` | string | Search engine — always `diamond` on this path. |
 | `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
 | `database_release` | string \| null | **Human-facing corpus version**, e.g. `v1.1` (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
@@ -221,7 +227,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 
 Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both query and target.
 
-**`target_id` format.** The build script (`scripts/build_diamond_shards.py`) keeps each record's **native corpus header** verbatim as the sequence ID — it does *not* synthesize or define this convention, which originates upstream in the Logan catalytic-ORF corpus. Observed IDs are pipe-delimited with **7 fields**, falling into two provenance types:
+**`target_id` format.** The build script (`scripts/db/build_diamond_shards.py`) keeps each record's **native corpus header** verbatim as the sequence ID — it does *not* synthesize or define this convention, which originates upstream in the Logan catalytic-ORF corpus. Observed IDs are pipe-delimited with **7 fields**, falling into two provenance types:
 
 | Field | Reference/structural hit | Logan metagenomic hit |
 |---|---|---|
@@ -290,7 +296,7 @@ A shard whose worker died before writing its sidecar appears as `{ "shard_index"
 
 ### Result depth & variable display count
 
-Every job searches to a **fixed server-side depth** — `RESULT_DEPTH` in [common.py](common.py), currently **500** — regardless of how many hits the caller asks to display. The request's `max_results` is accepted (the contract is unchanged) but is **presentational only**: it never reaches DIAMOND, never changes what is stored, and is **not part of the cache key**.
+Every job searches to a **fixed server-side depth** — `RESULT_DEPTH` in [common.py](src/common.py), currently **500** — regardless of how many hits the caller asks to display. The request's `max_results` is accepted (the contract is unchanged) but is **presentational only**: it never reaches DIAMOND, never changes what is stored, and is **not part of the cache key**.
 
 **Why.** `max_results` used to be both a search parameter (`-k` per shard, then the aggregator's truncation) *and* a cache-key input. So changing a displayed count produced a different `sessionId` → cache miss → a full 32-shard fan-out (~46 s, 32 Lambda invocations) to surface rows the previous job had **already computed and discarded** at the truncation step. The fan-out's cost is fixed — shard download plus seed-index rebuild — and is essentially independent of `-k`, so searching deep once and subsetting at view time is far cheaper than re-searching.
 
@@ -353,7 +359,7 @@ The original implementation was a single ARM64 container Lambda (`petadex-mmseqs
 2. Runs `mmseqs easy-search` against the index.
 3. Enriches hits from RDS and uploads the result JSON to `results/{sessionId}/{job_id}.json` in the same schema.
 
-This path (`lambda_function.py`, `scripts/update_sequence_index.py`) is **still deployed but no longer serves the web app** — the cutover to DIAMOND completed 2026-06-03. It is kept only during the transition; Phase 7 removes the `mmseqs` binary from the image, the legacy code paths, and the `mmseqs2/` S3 prefix once parity is reconfirmed. Its results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2` so they remain self-identifying if encountered.
+This path (`src/lambda_function.py`, `scripts/db/update_sequence_index.py`) **no longer serves the web app** — the cutover to DIAMOND completed 2026-06-03, and the `mmseqs` binary left the image on 2026-06-26 (the legacy function stays frozen on its last MMseqs2 image). Phase 7 removes the remaining legacy code paths and the `mmseqs2/` S3 prefix once parity is reconfirmed. Its results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2` so they remain self-identifying if encountered.
 
 ---
 
@@ -363,30 +369,41 @@ All Lambda roles share one ARM64 Docker image, dispatched by `ImageConfig.Comman
 
 ```
 petadex-sequence-search/
-├── orchestrator.py             # DIAMOND: validate, resolve version, start Step Functions (search/history/version)
-├── worker.py                   # DIAMOND: download one shard, run diamond blastp, write TSV part
-├── aggregator.py               # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
-├── common.py                   # Shared FASTA parse/validate + SEARCH_VERSION constant
-├── lambda_function.py          # Legacy single-Lambda MMseqs2 handler (no longer serving)
-├── cli.py                      # CLI entrypoint (outputs JSON to stdout)
-├── Dockerfile                  # ARM64 Lambda image — DIAMOND (built from source) + legacy mmseqs
-├── requirements.txt
+├── src/                          # Lambda code — copied flat into the image's task root
+│   ├── orchestrator.py           # DIAMOND: validate, resolve version, start Step Functions (search/history/version)
+│   ├── worker.py                 # DIAMOND: download one shard, run diamond blastp, write TSV part
+│   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
+│   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
+│   ├── lambda_function.py        # Legacy single-Lambda MMseqs2 handler (no longer serving)
+│   └── cli.py                    # Legacy CLI entrypoint (outputs JSON to stdout)
+├── data/
+│   └── example-sequences.txt     # IsPETase, FAST-PETase, SRR10663367 — regenerated on every deploy
 ├── infra/
 │   ├── search_state_machine.asl.json   # Step Functions Map definition (worker fan-out → aggregator)
 │   ├── architecture.d2 / architecture.svg  # data-flow diagram (source + render)
-│   └── iam/                             # least-privilege role policies per Lambda
+│   └── iam/                      # least-privilege role policies per Lambda
 ├── scripts/
-│   ├── build_diamond_shards.py    # Builds the sharded DIAMOND DB from the corpus FASTA (offline, arm64)
-│   ├── provision_diamond_infra.sh # One-time admin: create the 3 Lambdas + state machine + IAM
-│   ├── backfill_manifest_letters.py  # Populate manifest total_letters (e-value --dbsize) without a rebuild
-│   ├── reap_old_diamond_versions.sh  # LATEST-aware reaper for old diamond/{version}/ prefixes
-│   ├── striped_corpus_sample.py   # Corpus-size sampling for shard-count sizing
-│   ├── update_sequence_index.py   # Legacy: rebuilds the MMseqs2 index from PostgreSQL
-│   ├── setup_s3_access.sh         # S3 bucket/IAM setup helper
-│   └── README.md
-├── tests/
-│   ├── test_timing.py            # DIAMOND aggregator/worker timing + identity stamps (stubbed S3/RDS)
-│   └── test_search.py            # Legacy MMseqs2 path
+│   ├── db/                       # Build & maintain the sharded database
+│   │   ├── build_diamond_shards.py       # Builds the sharded DIAMOND DB from the corpus FASTA (offline, arm64)
+│   │   ├── backfill_manifest_letters.py  # Populate manifest total_letters (e-value --dbsize) without a rebuild
+│   │   ├── reap_old_diamond_versions.sh  # LATEST-aware reaper for old diamond/{version}/ prefixes
+│   │   ├── striped_corpus_sample.py      # Corpus-size sampling for shard-count sizing
+│   │   └── update_sequence_index.py      # Legacy: rebuilds the MMseqs2 index from PostgreSQL
+│   ├── deploy/                   # Provisioning & operations
+│   │   ├── provision_diamond_infra.sh    # One-time admin: create the 3 Lambdas + state machine + IAM
+│   │   ├── set_worker_env.py             # Update worker env vars without clobbering the rest
+│   │   ├── smoke_test.sh                 # Invoke the live orchestrator and poll for the result
+│   │   └── setup_s3_access.sh            # S3 bucket/IAM setup helper
+│   ├── bench/                    # Benchmarks against the live/devtest stack
+│   │   ├── bench_result_depth.py         # Search cost vs result depth (-k)
+│   │   └── stage2_devtest_runbook.sh, stage3_ab.py, stage3_fanout.py  # dev-build A/B harness
+│   ├── README.md, S3_SETUP.md, requirements.txt
+├── docker/
+│   └── Dockerfile.dev            # Dev-build worker image (pre-staged DIAMOND source)
+├── docs/                         # cutover.md, publishing.md
+├── assets/                       # Logo + GitHub social-preview image
+├── Dockerfile                    # ARM64 Lambda image — DIAMOND built from source
+├── requirements.txt
 └── .github/workflows/
     ├── deploy.yml                # Auto-deploy to Lambda on push to main
     ├── docker-publish.yml        # Publish image to Docker Hub on tag
@@ -460,12 +477,12 @@ Response:
 One ARM64 image serves all roles. Pushes to `main` build and deploy via GitHub Actions (`deploy.yml`):
 1. Bumps the semver tag
 2. Builds a `linux/arm64` image (on a native arm64 runner, with GHA layer cache — the DIAMOND source compile is slow under QEMU) and pushes to ECR
-3. `update-function-code` on the legacy `petadex-mmseqs2-search` **and** the three DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator}`), then updates the Step Functions state-machine definition. Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
+3. `update-function-code` on the three DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator}`), then updates the Step Functions state-machine definition. Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
 4. Regenerates the example searches.
 
 **One-time provisioning** (admin IAM, not the CI/build role) creates the 3 DIAMOND Lambdas, the `petadex-diamond-search` state machine, and their IAM roles from the same image:
 ```bash
-DB_SECRET_ARN=<rds-secret-arn> ./scripts/provision_diamond_infra.sh
+DB_SECRET_ARN=<rds-secret-arn> ./scripts/deploy/provision_diamond_infra.sh
 ```
 
 Manual code update (per function):
@@ -493,13 +510,13 @@ done
 
 ## Local Testing
 
-The image's default `CMD` is the **legacy** `lambda_function.handler`; the DIAMOND roles override it with their own handler (`worker.handler` / `orchestrator.handler` / `aggregator.handler`). The full DIAMOND fan-out depends on Step Functions + S3 shards and isn't exercisable purely locally — run a worker handler against a real shard, or smoke-test end-to-end via the deployed orchestrator (see `scripts/README.md`).
+The image's default `CMD` is `worker.handler`; the orchestrator and aggregator override it with their own handler (`orchestrator.handler` / `aggregator.handler`). Source lives in `src/` but is copied flat into the task root, so handler names carry no `src.` prefix. The full DIAMOND fan-out depends on Step Functions + S3 shards and isn't exercisable purely locally — run a worker handler against a real shard, or smoke-test end-to-end via the deployed orchestrator (see `scripts/README.md`).
 
 ```bash
 docker build -t petadex-search .
 
-# Lambda mode — default CMD runs the legacy MMseqs2 handler; pass a worker/orchestrator
-# handler as the image command to test a DIAMOND role.
+# Lambda mode — default CMD is the worker; pass orchestrator.handler / aggregator.handler
+# as the image command to test another role.
 docker run -p 9000:8080 \
   -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
@@ -508,7 +525,7 @@ docker run -p 9000:8080 \
 curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
   -d '{"action":"search","sessionId":"test","sequence":"MKLLIVLLALAVAALHAQQGVGAPVP","max_results":10}'
 
-# CLI mode (results to stdout, no S3 upload)
+# Legacy CLI mode (MMseqs2 — the binary is no longer in the image, so this only works on an old image)
 docker run --rm \
   -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
@@ -524,12 +541,12 @@ The sharded DIAMOND database is version-controlled via a `LATEST` pointer in `s3
 
 ```bash
 # On an arm64 host with diamond on PATH and ~300 GB scratch:
-python3 scripts/build_diamond_shards.py --scratch-dir /mnt/scratch
+python3 scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch
 ```
 
 No Lambda redeployment is needed — each worker resolves `LATEST` per job and pins the version, so the next job picks up a new build automatically. The runbook (instance type, scratch sizing, `total_letters` backfill for e-value `--dbsize`) is in `scripts/README.md`.
 
-> **Legacy:** the MMseqs2 index (`scripts/update_sequence_index.py`, `s3://petadex/mmseqs2/`) is retained during the transition but no longer serves the web app. See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
+> **Legacy:** the MMseqs2 index (`scripts/db/update_sequence_index.py`, `s3://petadex/mmseqs2/`) is retained during the transition but no longer serves the web app. See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
 
 ---
 

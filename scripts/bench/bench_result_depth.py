@@ -21,7 +21,7 @@ moving them under `diamond/benchmarks/result-depth/` and stripping the
 so a moved-but-still-tagged object is deleted after 14 days regardless of where
 it now lives. `--no-archive` leaves them in `results/` to expire normally.
 
-    python3 scripts/bench_result_depth.py --depths 50 250 500 --runs 3
+    python3 scripts/bench/bench_result_depth.py --depths 50 250 500 --runs 3
 """
 import argparse
 import base64
@@ -140,7 +140,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--query", default="IsPETase")
-    ap.add_argument("--fasta", default="example-sequences.txt")
+    ap.add_argument("--fasta", default="data/example-sequences.txt")
     ap.add_argument("--version", default=None)
     ap.add_argument("--session", default="benchdepth")
     ap.add_argument("--out", default=None)

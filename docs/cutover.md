@@ -54,12 +54,12 @@ merge cross-validated). Verdict **(A) cutover-ready**.
      binary's `ldd` shows **no dynamic libstdc++** before trusting it.
    - Either way confirm `diamond version` and that it opens a `.fa.zst`.
 2. **Re-validate on the devtest stack** (no prod risk): rebuild the devtest worker +
-   aggregator from the release image (`scripts/stage2_devtest_runbook.sh`), set the
+   aggregator from the release image (`scripts/bench/stage2_devtest_runbook.sh`), set the
    worker env `DIAMOND_FASTA_CROSSBLOCK_MERGE=1` (instead of the override), and re-run
    `ARM=zstd fanout` — expect **50 hits, `set_match=True`, MaxMem ~2.8 GB**. This
    re-confirms the *release* binary (not just `dev@4b2ae056`) before touching prod.
 3. **Build the production 32-shard zstd DB** of the current corpus:
-   `scripts/build_diamond_shards.py --format zstd --shard-count 32 --no-bump-latest`.
+   `scripts/db/build_diamond_shards.py --format zstd --shard-count 32 --no-bump-latest`.
    Keep `--no-bump-latest` until step 6.
 4. **Ship the prod image** via the normal pipeline (`deploy.yml`) with the bumped
    `DIAMOND_VERSION` (+ `DIAMOND_BUILD_TOOLCHAIN=gcc10` build-arg if step 1 needed it).
@@ -95,7 +95,7 @@ image tag.)
 
 - `obsidian-vault/.../08 Compressed-FASTA Merge Dev Build Validation.md` — full
   validation (Gates 1–2, Stage 3 A/B, verdict).
-- `scripts/stage2_devtest_runbook.sh` / `stage3_fanout.py` / `stage3_ab.py` — the
+- `scripts/bench/stage2_devtest_runbook.sh` / `stage3_fanout.py` / `stage3_ab.py` — the
   devtest harness used to validate; reuse it to re-validate the release binary.
 - **Open ask to Benjamin:** confirm the tagged release / stable commit that carries
   the compressed-FASTA cross-block-merge fix, to pin in step 1.

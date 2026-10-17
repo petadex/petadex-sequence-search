@@ -14,7 +14,7 @@
 # BUILD (arm64/Graviton box; source pre-staged, no token needed):
 #   git clone https://github.com/bbuchfink/diamond_dev.git diamond_dev   # your creds
 #   git -C diamond_dev checkout 4b2ae056851d28585ec7d3067ebaaaebdc7fbaac
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.dev \
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.dev \
 #     --build-arg DIAMOND_DEV_SHA=4b2ae056851d28585ec7d3067ebaaaebdc7fbaac \
 #     -t <ecr>/petadex-mmseq2-search:devtest-4b2ae05 .
 # (Or just: ./scripts/stage2_devtest_runbook.sh build — it verifies the SHA first.)
@@ -73,16 +73,13 @@ RUN test "$(git -C /tmp/diamond_dev rev-parse HEAD)" = "${DIAMOND_DEV_SHA}" && \
 RUN diamond version
 # ------------------------------------------------------------------------------
 
-# Python deps + function code + handler — all identical to ./Dockerfile.
+# Python deps + function code + handler — all identical to the root Dockerfile.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
 
-COPY lambda_function.py ${LAMBDA_TASK_ROOT}
-COPY common.py ${LAMBDA_TASK_ROOT}
-COPY worker.py ${LAMBDA_TASK_ROOT}
-COPY orchestrator.py ${LAMBDA_TASK_ROOT}
-COPY aggregator.py ${LAMBDA_TASK_ROOT}
-COPY cli.py ${LAMBDA_TASK_ROOT}
+# Lambda code lives in src/ but is copied FLAT into the task root, so handler
+# names stay `worker.handler` / `orchestrator.handler` / `aggregator.handler`.
+COPY src/*.py ${LAMBDA_TASK_ROOT}/
 RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
 
 CMD ["lambda_function.handler"]

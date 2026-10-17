@@ -70,7 +70,7 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_PORT: ${{ secrets.DB_PORT || '5432' }}
         run: |
-          python scripts/update_sequence_index.py
+          python scripts/db/update_sequence_index.py
 
       - name: Notify on success
         if: success()
