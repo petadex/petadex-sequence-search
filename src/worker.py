@@ -225,6 +225,13 @@ def fasta_block_size(shard_letters):
     return FASTA_BLOCK_SIZE
 
 
+def shard_local_path(shard_key):
+    """/tmp cache path for a shard, unique per S3 key (so per version):
+    diamond/<version>/shard_00.fa.zst -> /tmp/shard_diamond_<version>_shard_00.fa.zst.
+    Keeps the `shard_` prefix (eviction glob) and the extension (format detection)."""
+    return "/tmp/shard_" + shard_key.replace("/", "_")
+
+
 def download_shard(shard_key):
     """Download the shard DB to /tmp, cached across warm invocations. Returns the
     local file path (full filename, including extension).
@@ -233,9 +240,13 @@ def download_shard(shard_key):
     version, so a cached file is always valid for that key. Works for any DB
     format (`.dmnd` or `.fa.zst`/`.fa.gz`); run_shard_search derives the DIAMOND
     `-d` argument from the returned path.
+
+    The cache file is named after the WHOLE key, not its basename: every version
+    names its shards `shard_NN.<ext>`, so a basename cache served one version's
+    shard to a search pinned to another (seen 2026-10-26: v1.1 hits in a
+    v260701-pinned result and vice versa).
     """
-    basename = os.path.basename(shard_key)                # shard_00.dmnd / .fa.zst
-    local_path = f"/tmp/{basename}"
+    local_path = shard_local_path(shard_key)
 
     # A shard is ~1–6 GB and /tmp is 10 GB, so only ONE fits at a time. Warm-
     # container routing is NOT shard-affine — Lambda may hand this warm container
