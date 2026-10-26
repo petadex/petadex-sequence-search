@@ -1,0 +1,27 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DiamondDeployUpdate",
+            "Effect": "Allow",
+            "Action": [
+                "lambda:GetFunction",
+                "lambda:UpdateFunctionCode"
+            ],
+            "Resource": [
+                "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-orchestrator",
+                "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-worker",
+                "arn:aws:lambda:us-east-1:797308887321:function:petadex-diamond-aggregator"
+            ]
+        },
+        {
+            "Sid": "DiamondStateMachineUpdate",
+            "Effect": "Allow",
+            "Action": [
+                "states:DescribeStateMachine",
+                "states:UpdateStateMachine"
+            ],
+            "Resource": "arn:aws:states:us-east-1:797308887321:stateMachine:petadex-diamond-search"
+        }
+    ]
+}

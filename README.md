@@ -359,7 +359,7 @@ The original implementation was a single ARM64 container Lambda (`petadex-mmseqs
 2. Runs `mmseqs easy-search` against the index.
 3. Enriches hits from RDS and uploads the result JSON to `results/{sessionId}/{job_id}.json` in the same schema.
 
-This path (`src/lambda_function.py`, `scripts/db/update_sequence_index.py`) **no longer serves the web app** — the cutover to DIAMOND completed 2026-06-03, and the `mmseqs` binary left the image on 2026-06-26 (the legacy function stays frozen on its last MMseqs2 image). Phase 7 removes the remaining legacy code paths and the `mmseqs2/` S3 prefix once parity is reconfirmed. Its results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2` so they remain self-identifying if encountered.
+This path (`src/lambda_function.py`; its index builder `scripts/db/update_sequence_index.py` was removed 2026-10-26) **no longer serves the web app** — the cutover to DIAMOND completed 2026-06-03, and the `mmseqs` binary left the image on 2026-06-26 (the legacy function stays frozen on its last MMseqs2 image). Phase 7 removes the remaining legacy code paths and the `mmseqs2/` S3 prefix once parity is reconfirmed. Its results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2` so they remain self-identifying if encountered.
 
 ---
 
@@ -384,20 +384,23 @@ petadex-sequence-search/
 │   └── iam/                      # least-privilege role policies per Lambda
 ├── scripts/
 │   ├── db/                       # Build & maintain the sharded database
-│   │   ├── build_diamond_shards.py       # Builds the sharded DIAMOND DB from the corpus FASTA (offline, arm64)
+│   │   ├── build_diamond_shards.py       # Builds the sharded DIAMOND DB from a corpus FASTA (zstd shards build on any Linux box)
+│   │   ├── assemble_v260701_corpus.py    # v260701 full-length + core corpora (>petadex_id headers)
+│   │   ├── verify_v260701_corpus.sh      # Record-by-record check of those corpora against the source files
+│   │   ├── run_v260701_rebuild.sh        # Unattended v260701 run: verify → build/upload → checks → pinned validation
 │   │   ├── backfill_manifest_letters.py  # Populate manifest total_letters (e-value --dbsize) without a rebuild
 │   │   ├── reap_old_diamond_versions.sh  # LATEST-aware reaper for old diamond/{version}/ prefixes
-│   │   ├── striped_corpus_sample.py      # Corpus-size sampling for shard-count sizing
-│   │   └── update_sequence_index.py      # Legacy: rebuilds the MMseqs2 index from PostgreSQL
+│   │   └── striped_corpus_sample.py      # Corpus-size sampling for shard-count sizing
 │   ├── deploy/                   # Provisioning & operations
 │   │   ├── provision_diamond_infra.sh    # One-time admin: create the 3 Lambdas + state machine + IAM
 │   │   ├── set_worker_env.py             # Update worker env vars without clobbering the rest
 │   │   ├── smoke_test.sh                 # Invoke the live orchestrator and poll for the result
-│   │   └── setup_s3_access.sh            # S3 bucket/IAM setup helper
+│   │   └── validate_pinned_version.py    # Site examples pinned to a version vs LATEST; fails on cross-version hits
 │   ├── bench/                    # Benchmarks against the live/devtest stack
 │   │   ├── bench_result_depth.py         # Search cost vs result depth (-k)
+│   │   ├── bench_full_vs_cores.sh        # Full-length vs catalytic-core search DB (v260701 decision)
 │   │   └── stage2_devtest_runbook.sh, stage3_ab.py, stage3_fanout.py  # dev-build A/B harness
-│   ├── README.md, S3_SETUP.md, requirements.txt
+│   └── README.md
 ├── docker/
 │   └── Dockerfile.dev            # Dev-build worker image (pre-staged DIAMOND source)
 ├── docs/                         # cutover.md, publishing.md
@@ -406,8 +409,7 @@ petadex-sequence-search/
 ├── requirements.txt
 └── .github/workflows/
     ├── deploy.yml                # Auto-deploy to Lambda on push to main
-    ├── docker-publish.yml        # Publish image to Docker Hub on tag
-    └── update-database.yml.example
+    └── docker-publish.yml        # Publish image to Docker Hub on tag
 ```
 
 ---
@@ -544,7 +546,7 @@ python3 scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch
 
 No Lambda redeployment is needed — each worker resolves `LATEST` per job and pins the version, so the next job picks up a new build automatically. The runbook (instance type, scratch sizing, `total_letters` backfill for e-value `--dbsize`) is in `scripts/README.md`.
 
-> **Legacy:** the MMseqs2 index (`scripts/db/update_sequence_index.py`, `s3://petadex/mmseqs2/`) is retained during the transition but no longer serves the web app. See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
+> **Legacy:** the MMseqs2 index (`s3://petadex/mmseqs2/`) is retained during the transition but no longer serves the web app. Its builder script was removed 2026-10-26 (in git history). See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
 
 ---
 

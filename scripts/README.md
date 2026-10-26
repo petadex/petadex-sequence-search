@@ -1,207 +1,66 @@
-# Database Update Scripts
+# Scripts
 
-This directory contains scripts for building and uploading the PETadex sequence database to S3.
+Building, validating and operating the sharded DIAMOND search database.
 
 ## Files
 
-- **[update_sequence_index.py](db/update_sequence_index.py)** - (MMseqs2, legacy) extracts sequences from PostgreSQL, builds MMseqs2 database, and uploads to `mmseqs2/`
-- **[build_diamond_shards.py](db/build_diamond_shards.py)** - (DIAMOND, scale-out) streams the full Logan corpus FASTA from S3, builds the sharded DIAMOND database, and publishes it to `diamond/`
-- **[striped_corpus_sample.py](db/striped_corpus_sample.py)** - Phase 0 pre-build sampler used to size SHARD_COUNT
-- **[setup_s3_access.sh](deploy/setup_s3_access.sh)** - Script to create IAM user with limited S3 permissions
-- **[setup_search_alarms.sh](ops/setup_search_alarms.sh)** - Creates/updates the search CloudWatch alarms and their SNS → ntfy relay (idempotent; `--test` sends one push)
-- **[S3_SETUP.md](S3_SETUP.md)** - Detailed documentation for S3 access setup
-- **[requirements.txt](requirements.txt)** - Python dependencies
+**Database (`db/`)**
+- **[build_diamond_shards.py](db/build_diamond_shards.py)** - partitions a corpus FASTA into shards, builds each (`.fa.zst` or `.dmnd`), uploads them under `diamond/{version}/`, writes `manifest.json`, and moves `LATEST` last (unless `--no-bump-latest`)
+- **[assemble_v260701_corpus.py](db/assemble_v260701_corpus.py)** - assembles the v260701 full-length and catalytic-core corpora (`>petadex_id` headers) from the dataset-generation outputs
+- **[verify_v260701_corpus.sh](db/verify_v260701_corpus.sh)** - independent record-by-record check of those corpora against the source files
+- **[run_v260701_rebuild.sh](db/run_v260701_rebuild.sh)** - the unattended v260701 run: verify → build + upload (`--no-bump-latest`) → manifest/`LATEST` checks → pinned validation
+- **[striped_corpus_sample.py](db/striped_corpus_sample.py)** - pre-build sampler for sizing the shard count
+- **[backfill_manifest_letters.py](db/backfill_manifest_letters.py)** - adds `total_letters` to an older manifest
+- **[reap_old_diamond_versions.sh](db/reap_old_diamond_versions.sh)** - removes superseded versions under `diamond/`
 
-## Quick Start
+**Deploy and validation (`deploy/`)**
+- **[provision_diamond_infra.sh](deploy/provision_diamond_infra.sh)** - one-time creation of the orchestrator/worker/aggregator and state machine
+- **[set_worker_env.py](deploy/set_worker_env.py)** - worker environment changes
+- **[smoke_test.sh](deploy/smoke_test.sh)** - one search end to end through the live orchestrator
+- **[validate_pinned_version.py](deploy/validate_pinned_version.py)** - runs the site examples pinned to a version and against `LATEST`; fails on any hit from the wrong version
 
-### 1. Set up S3 Access
+**Benchmarks (`bench/`)** - `bench_full_vs_cores.sh` (search DB choice), `bench_result_depth.py`, and the Stage 2/3 dev-build runbooks.
 
-```bash
-# Run the automated setup script
-./scripts/deploy/setup_s3_access.sh
+**Operations (`ops/`)**
+- **[setup_search_alarms.sh](ops/setup_search_alarms.sh)** - creates/updates the search CloudWatch alarms and their SNS → ntfy relay (idempotent; `--test` sends one push)
 
-# Or see S3_SETUP.md for manual setup and other options
-```
+## Building a database version
 
-### 2. Install Dependencies
-
-```bash
-# Python packages
-pip install -r scripts/requirements.txt
-
-# MMseqs2 (choose one)
-brew install mmseqs2                    # macOS
-sudo apt install mmseqs2                # Ubuntu/Debian
-# or download from https://github.com/soedinglab/MMseqs2
-```
-
-### 3. Set Environment Variables
+Production searches zstd-compressed FASTA shards (`.fa.zst`) on DIAMOND 2.2.2 with the cross-block merge (`DIAMOND_FASTA_CROSSBLOCK_MERGE=1`, `-b1`). A zstd shard needs no `diamond makedb`, so a build runs on any Linux box with `zstd`, Python + `boto3`, enough scratch (about the corpus size), and S3 write on `s3://petadex/diamond/*`. The v260701 build ran on watson.
 
 ```bash
-# Database connection
-export DB_HOST="localhost"
-export DB_NAME="petadex"
-export DB_USER="postgres"
-export DB_PASSWORD="your-password"
+# Plan only:
+./scripts/db/build_diamond_shards.py --dry-run --format zstd ...
 
-# AWS credentials (from step 1)
-export AWS_ACCESS_KEY_ID="AKIAxxxxxxxxx"
-export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxx"
+# Build + upload WITHOUT publishing (LATEST untouched; pin it to test):
+./scripts/db/build_diamond_shards.py --format zstd --shard-count 32 \
+  --local-corpus /path/PETadex.seq.v260701.fa --key diamond/corpus/PETadex.seq.v260701.fa \
+  --expected-count 298687346 --expected-letters 88181580142 \
+  --release v260701 --version-prefix petadex_seq_v260701 \
+  --scratch-dir /scratch --threads 64 --no-bump-latest
+
+# Validate through the live orchestrator, pinned:
+AWS_PROFILE=default ./scripts/deploy/validate_pinned_version.py <version> validation.tsv
+
+# Publish (cutover) once validated:
+aws s3api put-object --bucket petadex --key diamond/LATEST --body <(printf '%s' <version>)
 ```
 
-### 4. Run Database Update
-
-```bash
-# Build and upload to S3
-./scripts/db/update_sequence_index.py
-
-# Or build locally only (for testing)
-./scripts/db/update_sequence_index.py --skip-s3
-```
-
-## Usage Examples
-
-### Test Locally First
-
-```bash
-# Build database locally without uploading
-./scripts/db/update_sequence_index.py --skip-s3
-
-# Check the generated files
-ls -lh /tmp/enzyme_fastaa_mmseqs_*
-```
-
-### Upload to S3
-
-```bash
-# Build and upload to default bucket (petadex-sequence-db)
-./scripts/db/update_sequence_index.py
-
-# Upload to custom bucket
-./scripts/db/update_sequence_index.py --bucket my-custom-bucket
-```
-
-### Use with Docker
-
-```bash
-# Build database inside Docker container
-docker run --rm \
-  -v $(pwd)/scripts:/scripts \
-  -e DB_HOST=host.docker.internal \
-  -e DB_NAME=petadex \
-  -e DB_USER=postgres \
-  -e DB_PASSWORD=password \
-  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  soedinglab/mmseqs2 \
-  python /scripts/db/update_sequence_index.py
-```
-
-## What Happens
-
-1. **Extract Sequences** - Queries PostgreSQL `enzyme_fastaa` table and creates FASTA file
-2. **Build MMseqs2 Database** - Creates searchable MMseqs2 index (~8 files)
-3. **Upload to S3** - Uploads all database files to `s3://petadex-sequence-db/mmseqs2/enzyme_fastaa_TIMESTAMP/`
-4. **Create Metadata** - Generates `metadata.json` with version info
-5. **Update LATEST** - Points `mmseqs2/LATEST` to new version
-6. **Cleanup** - Removes temporary files
-
-## DIAMOND Shard Builder (scale-out)
-
-`build_diamond_shards.py` is the Phase 1 pipeline for the sharded DIAMOND
-architecture. It **does not touch the MMseqs2 path** — it streams the full Logan
-corpus FASTA from S3 (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`,
-307,155,746 seqs — **not** the ~1M `enzyme_fastaa` RDS subset), partitions it
-into 20 shards, runs `diamond makedb` on each, and publishes them under the
-`diamond/` prefix with atomic versioning (shards → `manifest.json` → `LATEST`).
-
-### Where to run — NOT a laptop
-
-This is a heavy offline batch job, not something to run on a dev box:
-
-- **arm64 host** (the Phase 0 spike used an `r6g.2xlarge`) so the `.dmnd` format
-  matches the ARM64 Lambda workers.
-- **~300 GB scratch volume** (EBS) on `--scratch-dir`. Budget: one streaming
-  pass writes ~116 GB of shard FASTAs (deleted as each `.dmnd` is built), and
-  the `.dmnd` shards total ~144 GiB.
-- `diamond` v2.1+ on `PATH`, `boto3` installed, and S3 read on
-  `s3://petadex/logan/*` + write on `s3://petadex/diamond/*`.
-
-```bash
-pip install -r scripts/requirements.txt          # boto3
-# diamond: download the arm64 binary from https://github.com/bbuchfink/diamond
-
-# Full build → upload → bump LATEST (the real Phase 1 artifact):
-./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch
-
-# Dry run (prints the plan, touches nothing):
-./scripts/db/build_diamond_shards.py --dry-run
-
-# Build + upload a version WITHOUT publishing it (inspect before going live):
-./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch --no-bump-latest
-# ...then publish once verified:
-aws s3api put-object --bucket petadex --key diamond/LATEST \
-  --body <(printf '%s' catalytic_orfs_v1.1_YYYYMMDD_HHMMSS)
-
-# Build locally only, no S3 writes at all (e.g. on a scratch box):
-./scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch --skip-upload
-```
-
-Key flags: `--partition {round-robin,contiguous}` (default `round-robin` — even
-shard sizes keep worker `/tmp` footprint and fan-out search times uniform under
-the fail-fast Step Functions Map), `--shard-count` (default 20),
-`--threads` (default all cores), `--version`, `--keep-fasta`.
+`--expected-count`, `--expected-letters`, `--release` and `--version-prefix` default to v1.1's values. Pass them for any other corpus. Other flags: `--partition {round-robin,contiguous}` (default round-robin), `--shard-count` (default 32), `--threads`, `--version`, `--keep-fasta`, `--skip-upload`, `--max-records` (smoke test only).
 
 Published layout:
 
 ```
-s3://petadex/diamond/{version}/shard_00.dmnd … shard_19.dmnd
-s3://petadex/diamond/{version}/manifest.json   # shard count, per-shard seqs + bytes, build date
+s3://petadex/diamond/{version}/shard_00.fa.zst … shard_31.fa.zst
+s3://petadex/diamond/{version}/manifest.json   # version, database_release, total_letters, per-shard seqs/letters/bytes
 s3://petadex/diamond/LATEST                     # → {version}  (written LAST)
 ```
 
-## Lambda Integration
+Workers resolve the version once per job (`LATEST`, or the request's `version`) and cache shards in `/tmp` under the full S3 key, so a new version needs no Lambda redeploy, and two versions never share a cached shard.
 
-The Lambda function automatically uses the latest database version:
+## Removed
 
-1. On cold start, Lambda reads `s3://petadex-sequence-db/mmseqs2/LATEST`
-2. Downloads database files from the version specified in LATEST
-3. Caches database in `/tmp` for subsequent invocations
-4. Automatically picks up new versions on next cold start
-
-No Lambda redeployment needed when updating the database!
-
-## Automation
-
-See [S3_SETUP.md](S3_SETUP.md) for GitHub Actions OIDC setup to run updates automatically without managing credentials.
-
-## Troubleshooting
-
-### `psycopg2` Import Error
-```bash
-pip install psycopg2-binary
-```
-
-### `mmseqs` Command Not Found
-Install MMseqs2 (see step 2 above)
-
-### S3 Permission Denied
-Check AWS credentials are set and IAM policy is attached
-
-### Database Connection Failed
-Verify PostgreSQL is running and credentials are correct
-
-## Security
-
-The IAM user created by `setup_s3_access.sh` has minimal permissions:
-- ✓ Upload files to `petadex-sequence-db` bucket
-- ✓ List files in `petadex-sequence-db` bucket
-- ✓ Download files from `petadex-sequence-db` bucket
-- ✗ Cannot access other buckets
-- ✗ Cannot create Lambda functions
-- ✗ Cannot modify IAM policies
-
-See [S3_SETUP.md](S3_SETUP.md) for additional security options like IP restrictions and OIDC.
+The legacy MMseqs2 index builder (`db/update_sequence_index.py`, its `requirements.txt`, `S3_SETUP.md`, `deploy/setup_s3_access.sh` and the `update-database.yml.example` workflow) was removed on 2026-10-26. It rebuilt the ~1M-sequence `enzyme_fastaa` MMseqs2 index, which has not served the web app since the DIAMOND cutover (2026-06-03). It is in git history.
 
 ## Support
 

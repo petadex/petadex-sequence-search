@@ -34,7 +34,7 @@ Partitioning (--partition):
     sizes vary. The head shard measured 6.58 GiB; still under the ~8-9 GB /tmp
     ceiling, but round-robin is preferred for the uniformity reason above.
 
-The mmseqs2/ path and update_sequence_index.py are untouched — this writes only
+The legacy mmseqs2/ path is untouched — this writes only
 under the diamond/ prefix.
 """
 
