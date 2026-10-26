@@ -17,6 +17,12 @@ Event (web-app contract, unchanged):
     { "action": "history", "sessionId": "..." }
     { "action": "version" }
 
+The petadex.io backend also sends `clientIp` on search. Its presence marks a
+public search, which must pass `check_admission` (rate and concurrency limits)
+first; a refusal returns 429 (or 503 if the limits can't be checked) with
+`{error, limit, retry_after}`. The backend invokes search synchronously so it
+can relay that status.
+
 NOTE `max_results` is still accepted but is now PRESENTATIONAL only — every job
 searches to the fixed `common.RESULT_DEPTH` and the web app subsets at view
 time, so changing a display count no longer re-runs the fan-out. See
@@ -41,11 +47,12 @@ Version pinning: `LATEST` is read ONCE here and the resolved version flows into
 the execution input, so every worker pins to it even if `LATEST` flips mid-job.
 """
 
+import hashlib
 import json
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -59,6 +66,90 @@ STATE_MACHINE_ARN = os.environ.get("STATE_MACHINE_ARN")
 
 s3 = boto3.client("s3", region_name="us-east-1")
 sfn = boto3.client("stepfunctions", region_name="us-east-1")
+
+# Admission limits for PUBLIC searches (events carrying `clientIp`, i.e. relayed
+# by the petadex.io backend). Every admitted search fans out 32 workers, so an
+# unthrottled script could both run up Lambda spend and overrun the worker
+# reserved concurrency, which under fail-fast fails every in-flight job. Direct
+# IAM invokes (deploy example regen, benchmarks) carry no clientIp and skip this.
+# Real traffic is a few searches a day (37 in the 90 days to 2026-10-26, peak 9
+# in one hour), so these sit far above normal use.
+MAX_RUNNING_JOBS = int(os.environ.get("MAX_RUNNING_JOBS", "4"))  # 4×32=128 of 200 reserved
+MAX_JOBS_PER_IP_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_IP_PER_HOUR", "10"))
+MAX_JOBS_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_HOUR", "30"))
+MAX_JOBS_PER_DAY = int(os.environ.get("MAX_JOBS_PER_DAY", "100"))
+
+
+class AdmissionDenied(Exception):
+    """A public search refused by `check_admission`; maps to an HTTP status."""
+
+    def __init__(self, status, limit, message, retry_after):
+        super().__init__(message)
+        self.status = status
+        self.limit = limit
+        self.retry_after = max(1, int(retry_after))
+
+
+def client_tag(client_ip):
+    """Pseudonymous 8-hex tag for a client IP, prefixed onto execution names.
+
+    The execution history is the only per-client record, so no extra store
+    (the backend's VPC reaches only S3, Lambda and RDS, and the DB user is
+    read-only). A hash, not the raw IP, so names don't carry addresses.
+    """
+    return hashlib.sha256(f"petadex-search:{client_ip}".encode()).hexdigest()[:8]
+
+
+def check_admission(tag):
+    """Raise AdmissionDenied if a new public search would exceed a limit.
+
+    One ListExecutions sweep over the last 24 h (newest first, so it stops at
+    the cutoff) yields every count: running jobs, global hour/day starts, and
+    this client's starts in the hour (execution names begin `{tag}_`). Failed
+    and aborted executions count too: their workers still ran. Concurrent
+    orchestrators can race past MAX_RUNNING_JOBS by a job or two, which the
+    gap to the 200-worker reservation absorbs.
+    """
+    now = datetime.now(timezone.utc)
+    hour_ago, day_ago = now - timedelta(hours=1), now - timedelta(days=1)
+    running, hour_starts, day_starts, ip_starts = 0, [], [], []
+    pages = sfn.get_paginator("list_executions").paginate(
+        stateMachineArn=STATE_MACHINE_ARN, PaginationConfig={"PageSize": 1000})
+    for page in pages:
+        for ex in page["executions"]:
+            started = ex["startDate"]
+            if started < day_ago:
+                break
+            day_starts.append(started)
+            running += ex["status"] == "RUNNING"
+            if started >= hour_ago:
+                hour_starts.append(started)
+                if ex["name"].startswith(f"{tag}_"):
+                    ip_starts.append(started)
+        else:
+            continue
+        break
+
+    def until_aged_out(starts, window, limit):
+        # Seconds until the start that put the window at its limit leaves it.
+        return (starts[limit - 1] + window - now).total_seconds()
+
+    if running >= MAX_RUNNING_JOBS:
+        raise AdmissionDenied(429, "running",
+                              "PETadex search is busy right now. Please try again in a minute.", 30)
+    if len(ip_starts) >= MAX_JOBS_PER_IP_PER_HOUR:
+        raise AdmissionDenied(429, "client_hour",
+                              f"Search limit reached ({MAX_JOBS_PER_IP_PER_HOUR} new searches "
+                              "per hour). Previously run searches still load instantly.",
+                              until_aged_out(ip_starts, timedelta(hours=1), MAX_JOBS_PER_IP_PER_HOUR))
+    if len(hour_starts) >= MAX_JOBS_PER_HOUR:
+        raise AdmissionDenied(429, "global_hour",
+                              "PETadex search has reached its hourly capacity. Please try again later.",
+                              until_aged_out(hour_starts, timedelta(hours=1), MAX_JOBS_PER_HOUR))
+    if len(day_starts) >= MAX_JOBS_PER_DAY:
+        raise AdmissionDenied(429, "global_day",
+                              "PETadex search has reached its daily capacity. Please try again later.",
+                              until_aged_out(day_starts, timedelta(days=1), MAX_JOBS_PER_DAY))
 
 
 def resolve_version(requested=None):
@@ -118,7 +209,7 @@ def load_shards(version):
 
 
 def start_search(session_id, job_id, version, query_header, query_sequence,
-                 max_results, shards, db_meta, orch_timing=None):
+                 max_results, shards, db_meta, orch_timing=None, tag=None):
     """Start the Step Functions Map execution. Returns immediately (async).
 
     The execution input carries `querySequence`/`queryHeader` (not a prebuilt
@@ -129,6 +220,9 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
     `orch_timing` (optional): the orchestrator's own pre-start phase durations
     (parse/resolve/load), passed through untouched (the ASL preserves top-level
     fields) so the aggregator can fold them into timing.json.
+
+    `tag` (optional): the client tag of a public search, prefixed onto the
+    execution name so `check_admission` can count that client's jobs.
     """
     if not STATE_MACHINE_ARN:
         raise RuntimeError("STATE_MACHINE_ARN is not configured")
@@ -162,9 +256,11 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
     }
     # Name the execution after the job for traceability + idempotency (a retried
     # invoke with the same jobId collides instead of double-fanning-out).
+    # Public searches: `{tag}_{md5}-{uuid}` is 78 chars, inside the 80 cap.
+    name = f"{tag}_{session_id}-{job_id}" if tag else f"{session_id}-{job_id}"
     sfn.start_execution(
         stateMachineArn=STATE_MACHINE_ARN,
-        name=f"{session_id}-{job_id}"[:80],
+        name=name[:80],
         input=json.dumps(payload),
     )
 
@@ -298,17 +394,36 @@ def handler(event, context):
         shards, db_meta = load_shards(version)
         load_shards_ms = round((time.monotonic() - t1) * 1000, 1)
 
+        # Public searches only (see MAX_RUNNING_JOBS). Fails closed: if the
+        # limits can't be checked, the search doesn't start.
+        tag = None
+        admission_ms = None
+        if body.get("clientIp") is not None:
+            tag = client_tag(str(body["clientIp"])[:64])
+            t1 = time.monotonic()
+            try:
+                check_admission(tag)
+            except AdmissionDenied:
+                raise
+            except Exception as e:
+                print(f"Admission check failed, refusing search: {e}")
+                raise AdmissionDenied(503, "unavailable",
+                                      "PETadex search is temporarily unavailable. Please try again shortly.",
+                                      30)
+            admission_ms = round((time.monotonic() - t1) * 1000, 1)
+
         job_id = str(uuid.uuid4())
         orch_timing = {
             "parse_ms": parse_ms,
             "resolve_version_ms": resolve_version_ms,
             "load_shards_ms": load_shards_ms,
+            "admission_ms": admission_ms,
             "total_pre_start_ms": round((time.monotonic() - orch_t0) * 1000, 1),
         }
 
         t0 = time.time()
         start_search(session_id, job_id, version, query_header, query_sequence,
-                     max_results, shards, db_meta, orch_timing)
+                     max_results, shards, db_meta, orch_timing, tag)
         print(f"TIMING start_execution: {time.time() - t0:.2f}s "
               f"(version={version}, shards={len(shards)}, jobId={job_id})")
 
@@ -318,6 +433,10 @@ def handler(event, context):
             "s3_key": f"results/{session_id}/{job_id}.json",
         })
 
+    except AdmissionDenied as e:
+        print(f"Admission denied ({e.limit}): {e}")
+        return _resp(e.status, {"error": str(e), "limit": e.limit,
+                                "retry_after": e.retry_after})
     except ValueError as e:
         print(f"Validation error: {e}")
         return _resp(400, {"error": str(e)})
