@@ -8,6 +8,7 @@ This directory contains scripts for building and uploading the PETadex sequence 
 - **[build_diamond_shards.py](db/build_diamond_shards.py)** - (DIAMOND, scale-out) streams the full Logan corpus FASTA from S3, builds the sharded DIAMOND database, and publishes it to `diamond/`
 - **[striped_corpus_sample.py](db/striped_corpus_sample.py)** - Phase 0 pre-build sampler used to size SHARD_COUNT
 - **[setup_s3_access.sh](deploy/setup_s3_access.sh)** - Script to create IAM user with limited S3 permissions
+- **[setup_search_alarms.sh](ops/setup_search_alarms.sh)** - Creates/updates the search CloudWatch alarms and their SNS → ntfy relay (idempotent; `--test` sends one push)
 - **[S3_SETUP.md](S3_SETUP.md)** - Detailed documentation for S3 access setup
 - **[requirements.txt](requirements.txt)** - Python dependencies
 

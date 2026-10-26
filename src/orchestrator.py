@@ -106,9 +106,10 @@ def check_admission(tag):
     One ListExecutions sweep over the last 24 h (newest first, so it stops at
     the cutoff) yields every count: running jobs, global hour/day starts, and
     this client's starts in the hour (execution names begin `{tag}_`). Failed
-    and aborted executions count too: their workers still ran. Concurrent
-    orchestrators can race past MAX_RUNNING_JOBS by a job or two, which the
-    gap to the 200-worker reservation absorbs.
+    and aborted executions count too: their workers still ran. The check and
+    the start aren't atomic; the orchestrator's reserved concurrency of 2
+    bounds the race to one extra job, which the gap to the 200-worker
+    reservation absorbs.
     """
     now = datetime.now(timezone.utc)
     hour_ago, day_ago = now - timedelta(hours=1), now - timedelta(days=1)
