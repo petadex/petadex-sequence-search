@@ -81,8 +81,8 @@ def fetch_metadata(accession_ids):
         conn.close()
 
 
-def read_parts(session_id, job_id):
-    """Read + parse every shard part TSV into result dicts.
+def parse_part(text):
+    """Parse one shard part (DIAMOND outfmt-6 TSV text) into result dicts.
 
     DIAMOND outfmt-6 column order (set by the worker):
         sseqid qstart qend sstart send length pident evalue bitscore full_sseq
@@ -91,7 +91,39 @@ def read_parts(session_id, job_id):
     the worker so this parser stays backward-compatible: a part written by an
     older worker has only 9 columns and yields `target_sequence: None` rather
     than failing the merge (which, under fail-fast, would fail the whole job).
+
+    Pure (no S3), so the local CLI parses its output with exactly this code.
     """
+    results = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        if len(p) < 9:
+            continue
+        pident = float(p[6])
+        # Silent-corruption guard: DIAMOND emits 0–100, never 0–1.
+        # Do NOT multiply by 100 (that is the MMseqs2 `fident` path).
+        assert 0.0 <= pident <= 100.0, f"pident {pident} out of [0,100]: {line!r}"
+        results.append({
+            "target_id": p[0],
+            "query_start": int(p[1]),
+            "query_end": int(p[2]),
+            "target_start": int(p[3]),
+            "target_end": int(p[4]),
+            "alignment_length": int(p[5]),
+            "percent_identity": pident,
+            "evalue": float(p[7]),
+            "bitscore": float(p[8]),
+            # Full target amino-acid sequence (DIAMOND `full_sseq`).
+            # None for parts written by a pre-full_sseq worker.
+            "target_sequence": p[9] if len(p) > 9 else None,
+        })
+    return results
+
+
+def read_parts(session_id, job_id):
+    """Read + parse every shard part TSV under the job's parts/ prefix."""
     prefix = f"results/{session_id}/{job_id}/parts/"
     paginator = s3.get_paginator("list_objects_v2")
     results = []
@@ -102,30 +134,7 @@ def read_parts(session_id, job_id):
                 continue
             n_parts += 1
             body = s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read()
-            for line in body.decode().splitlines():
-                if not line.strip():
-                    continue
-                p = line.split("\t")
-                if len(p) < 9:
-                    continue
-                pident = float(p[6])
-                # Silent-corruption guard: DIAMOND emits 0–100, never 0–1.
-                # Do NOT multiply by 100 (that is the MMseqs2 `fident` path).
-                assert 0.0 <= pident <= 100.0, f"pident {pident} out of [0,100]: {line!r}"
-                results.append({
-                    "target_id": p[0],
-                    "query_start": int(p[1]),
-                    "query_end": int(p[2]),
-                    "target_start": int(p[3]),
-                    "target_end": int(p[4]),
-                    "alignment_length": int(p[5]),
-                    "percent_identity": pident,
-                    "evalue": float(p[7]),
-                    "bitscore": float(p[8]),
-                    # Full target amino-acid sequence (DIAMOND `full_sseq`).
-                    # None for parts written by a pre-full_sseq worker.
-                    "target_sequence": p[9] if len(p) > 9 else None,
-                })
+            results.extend(parse_part(body.decode()))
     return results, n_parts
 
 

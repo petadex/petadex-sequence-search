@@ -375,7 +375,7 @@ petadex-sequence-search/
 │   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
 │   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
 │   ├── lambda_function.py        # Legacy single-Lambda MMseqs2 handler (no longer serving)
-│   └── cli.py                    # Legacy CLI entrypoint (outputs JSON to stdout)
+│   └── cli.py                    # Local DIAMOND search against any local DB (no AWS; JSON to stdout)
 ├── data/
 │   └── example-sequences.txt     # IsPETase, FAST-PETase, SRR10663367 — regenerated on every deploy
 ├── infra/
@@ -525,12 +525,10 @@ docker run -p 9000:8080 \
 curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
   -d '{"action":"search","sessionId":"test","sequence":"MKLLIVLLALAVAALHAQQGVGAPVP","max_results":10}'
 
-# Legacy CLI mode (MMseqs2 — the binary is no longer in the image, so this only works on an old image)
-docker run --rm \
-  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  --entrypoint python3 \
-  petadex-search cli.py "MKLLIVLLALAVAALHAQQGVGAPVP" 10
+# Local CLI — same diamond call + parser as production, against a local DB (no AWS).
+# --db takes a .dmnd, a protein FASTA, or a .fa.zst. Test: python tests/test_cli.py
+docker run --rm -v $PWD:/work --entrypoint python3 \
+  petadex-search cli.py --db /work/mydb.dmnd --max-results 10 "MKLLIVLLALAVAALHAQQGVGAPVP"
 ```
 
 ---

@@ -80,5 +80,5 @@ RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
 # `orchestrator.handler`, aggregator → `aggregator.handler`); the worker uses
 # this default. The legacy `lambda_function.py` is still copied above (inert —
 # nothing invokes it now that MMseqs2 is removed) pending full Phase 7 removal.
-# Override with: docker run --entrypoint python3 image cli.py
+# Local CLI (no AWS): docker run --entrypoint python3 -v $PWD:/work image cli.py --db /work/x.dmnd SEQ
 CMD ["worker.handler"]
