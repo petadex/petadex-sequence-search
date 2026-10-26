@@ -8,13 +8,15 @@ Runs each site example (data/example-sequences.txt) twice: pinned to VERSION
 search: hits, top hit, top identity, wall time, database version/release.
 `LATEST` is only read, never written.
 
-Fails (exit 1) if any pinned search fails, returns no hits, or comes back
-labelled with a different database_version.
+Fails (exit 1) if any pinned search fails, returns no hits, comes back
+labelled with a different database_version, or holds a hit that is not a
+v260701 petadex_id, or if a v1.1 LATEST search holds one (cross-version leak).
 
 Usage: validate_pinned_version.py VERSION OUT.tsv
 """
 
 import json
+import re
 import sys
 import time
 import uuid
@@ -26,6 +28,9 @@ BUCKET = "petadex"
 ORCH = "petadex-diamond-orchestrator"
 EXAMPLES = Path(__file__).resolve().parents[2] / "data" / "example-sequences.txt"
 TIMEOUT_S = 15 * 60
+# v260701 hit IDs are bare petadex_ids; v1.1's are `orf||run|…` / `n|acc|||||`.
+# A hit of the other format means a worker searched the wrong version's shard.
+PETADEX_ID = re.compile(r"^(PL|NR|LG)\d+$")
 
 lam = boto3.client("lambda", region_name="us-east-1")
 s3 = boto3.client("s3", region_name="us-east-1")
@@ -85,6 +90,7 @@ def search(name, seq, version):
         "top_bitscore": top.get("bitscore"),
         "top_evalue": top.get("evalue"),
         "total_wall_ms": timing.get("total_wall_ms"),
+        "n_petadex_ids": sum(bool(PETADEX_ID.match(h["target_id"])) for h in hits),
     }
 
 
@@ -92,7 +98,8 @@ def main():
     version, out = sys.argv[1], Path(sys.argv[2])
     cols = ["example", "arm", "status", "database_version", "database_release",
             "search_version", "num_results", "top_target", "top_pident",
-            "top_bitscore", "top_evalue", "total_wall_ms", "session", "job"]
+            "top_bitscore", "top_evalue", "total_wall_ms", "n_petadex_ids",
+            "session", "job"]
     rows, ok = [], True
     for name, seq in read_examples().items():
         for arm, ver in (("pinned", version), ("latest", None)):
@@ -101,7 +108,12 @@ def main():
             rows.append(r)
             print("\t".join(str(r.get(c, "")) for c in cols), flush=True)
             if arm == "pinned" and (r["status"] != "ok" or not r["num_results"]
-                                    or r.get("database_version") != version):
+                                    or r.get("database_version") != version
+                                    or r["n_petadex_ids"] != r["num_results"]):
+                ok = False
+            # LATEST is v1.1 until cutover: any petadex_id there is a leak.
+            if arm == "latest" and r.get("database_release") == "v1.1" \
+                    and r.get("n_petadex_ids"):
                 ok = False
     with open(out, "w") as f:
         f.write("\t".join(cols) + "\n")
