@@ -123,6 +123,42 @@ check("200 with no clientIp", status == 200, f"{status} {body}")
 check("untagged execution name", started and started[0].startswith("a" * 32 + "-"), started)
 check("no ListExecutions call", not orch.sfn.get_paginator.called)
 
+print("\n=== in-flight dedup: attach to a running job for the same session ===")
+JOB = "11111111-2222-4333-8444-555555555555"
+other = orch.client_tag("198.51.100.9")
+orch, started = load_orchestrator([ex(0.2, "RUNNING", name=f"{other}_{'a' * 32}-{JOB}"), ex(5)])
+status, body = search(orch)
+check("200 deduped onto the running job", status == 200 and body.get("deduped") is True
+      and body.get("job_id") == JOB, f"{status} {body}")
+check("s3_key names the running job", body.get("s3_key") == f"results/{'a' * 32}/{JOB}.json", body)
+check("nothing started", not started)
+orch, started = load_orchestrator([ex(0.2, "RUNNING", name=f"{'a' * 32}-{JOB}")])
+status, body = search(orch)
+check("matches an untagged (direct-invoke) execution too", body.get("job_id") == JOB and not started, body)
+
+print("\n=== dedup runs before the limits ===")
+running = [ex(0.2, "RUNNING", name=f"{tag}_{'a' * 32}-{JOB}")] + [ex(1, "RUNNING") for _ in range(4)]
+orch, started = load_orchestrator(running)
+status, body = search(orch)
+check("deduped, not 429, at MAX_RUNNING_JOBS", status == 200 and body.get("job_id") == JOB, f"{status} {body}")
+mine = [ex(0.2, "RUNNING", name=f"{tag}_{'a' * 32}-{JOB}")] + [ex(5 + i, name=f"{tag}_{'b' * 32}-job{i}") for i in range(10)]
+orch, started = load_orchestrator(mine)
+status, body = search(orch)
+check("deduped, not 429, over the per-client cap", status == 200 and body.get("job_id") == JOB, f"{status} {body}")
+
+print("\n=== no dedup without a matching RUNNING execution ===")
+orch, started = load_orchestrator([ex(1, "SUCCEEDED", name=f"{tag}_{'a' * 32}-{JOB}"),
+                                   ex(1, "FAILED", name=f"{tag}_{'a' * 32}-{JOB}")])
+status, body = search(orch)
+check("finished runs of the session start a new job", status == 200 and "deduped" not in body and started, body)
+orch, started = load_orchestrator([ex(0.2, "RUNNING", name=f"{tag}_{'c' * 32}-{JOB}"),
+                                   ex(0.2, "RUNNING", name=f"{tag}_{'a' * 31}-{JOB}")])
+status, body = search(orch)
+check("other sessions (incl. a prefix) don't match", status == 200 and "deduped" not in body and started, body)
+orch, started = load_orchestrator([ex(0.2, "RUNNING", name=f"{tag}_{'a' * 32}-{JOB}")])
+status, body = search(orch, client_ip=None)
+check("direct invokes don't dedup", status == 200 and "deduped" not in body and started, body)
+
 print("\n=== invalid sequence is rejected before admission ===")
 orch, _ = load_orchestrator([])
 resp = orch.handler({"action": "search", "sessionId": "a" * 32, "sequence": "12345", "clientIp": "1.2.3.4"}, None)

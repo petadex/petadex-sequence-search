@@ -30,6 +30,9 @@ common.RESULT_DEPTH.
 
 Search response (unchanged):
     { "job_id": "<uuid>", "s3_key": "results/{sessionId}/{jobId}.json" }
+A public search whose sessionId is already running attaches to that job
+instead of starting another (in-flight dedup, see `check_admission`); the
+response then names the running job and adds `"deduped": true`.
 
 Coordination — Step Functions Map (locked, Section 5). The orchestrator starts
 an execution with this input; the Map's ItemSelector merges each `shards[*]`
@@ -100,9 +103,32 @@ def client_tag(client_ip):
     return hashlib.sha256(f"petadex-search:{client_ip}".encode()).hexdigest()[:8]
 
 
-def check_admission(tag):
-    """Raise AdmissionDenied if a new public search would exceed a limit.
+def execution_job(name, session_id):
+    """Return the jobId if execution `name` is a search of `session_id`, else None.
 
+    Names are `{session}-{jobId}` or, for public searches, `{tag}_{session}-{jobId}`
+    (see start_search); jobId is a 36-char uuid4.
+    """
+    job_id, prefix = name[-36:], name[:-37]
+    if name[-37:-36] != "-":
+        return None
+    if prefix == session_id or (prefix[8:9] == "_" and prefix[9:] == session_id):
+        return job_id
+    return None
+
+
+def check_admission(tag, session_id):
+    """Admit a public search: return a running jobId to attach to, or None.
+
+    In-flight dedup: if a RUNNING execution already searches this sessionId
+    (the web app's cache key, so same sequence + database + search version),
+    its jobId is returned and nothing new should start. This is checked before
+    the limits because attaching costs nothing, so it is never refused. The
+    caller polls by session, so the existing job's result (or failure) serves
+    both requests. Two requests within the ListExecutions lag (~1 s) can still
+    both start.
+
+    Otherwise raise AdmissionDenied if a new search would exceed a limit.
     One ListExecutions sweep over the last 24 h (newest first, so it stops at
     the cutoff) yields every count: running jobs, global hour/day starts, and
     this client's starts in the hour (execution names begin `{tag}_`). Failed
@@ -122,7 +148,11 @@ def check_admission(tag):
             if started < day_ago:
                 break
             day_starts.append(started)
-            running += ex["status"] == "RUNNING"
+            if ex["status"] == "RUNNING":
+                running += 1
+                inflight = execution_job(ex["name"], session_id)
+                if inflight:
+                    return inflight
             if started >= hour_ago:
                 hour_starts.append(started)
                 if ex["name"].startswith(f"{tag}_"):
@@ -403,7 +433,7 @@ def handler(event, context):
             tag = client_tag(str(body["clientIp"])[:64])
             t1 = time.monotonic()
             try:
-                check_admission(tag)
+                inflight = check_admission(tag, session_id)
             except AdmissionDenied:
                 raise
             except Exception as e:
@@ -412,6 +442,13 @@ def handler(event, context):
                                       "PETadex search is temporarily unavailable. Please try again shortly.",
                                       30)
             admission_ms = round((time.monotonic() - t1) * 1000, 1)
+            if inflight:
+                print(f"Deduped onto running job {inflight} (sessionId={session_id})")
+                return _resp(200, {
+                    "job_id": inflight,
+                    "s3_key": f"results/{session_id}/{inflight}.json",
+                    "deduped": True,
+                })
 
         job_id = str(uuid.uuid4())
         orch_timing = {
