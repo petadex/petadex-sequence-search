@@ -54,6 +54,7 @@ from boto3.s3.transfer import TransferConfig
 
 DEFAULT_BUCKET = "petadex"
 DEFAULT_KEY = "logan/petadex.catalytic_orfs.v1.1.fa"
+# v1.1 defaults; another corpus passes --expected-count / --expected-letters.
 CORPUS_COUNT = 307_155_746  # Phase 0 Check 0 ground truth
 CORPUS_LETTERS = 104_940_484_545  # total residues (backfilled estimate, §10.8)
 # 32 (was Phase 0's 20): a 20-shard zstd shard (~5.25 Gletters) forces a single
@@ -109,7 +110,8 @@ def shard_for(record_index, partition, shard_count, shard_size):
 
 
 def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
-                         max_records=None, local_path=None):
+                         max_records=None, local_path=None,
+                         expected_count=CORPUS_COUNT):
     """Single streaming pass: split the corpus into SHARD_COUNT FASTA files.
 
     Reads the S3 body (or a local file if local_path is set) in STREAM_CHUNK
@@ -130,7 +132,7 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
         obj = s3.get_object(Bucket=bucket, Key=key)
         obj_size = obj["ContentLength"]
         body = obj["Body"]
-    shard_size = math.ceil(CORPUS_COUNT / shard_count)
+    shard_size = math.ceil(expected_count / shard_count)
 
     counts = [0] * shard_count
     letters = [0] * shard_count
@@ -207,9 +209,9 @@ def stream_and_partition(s3, bucket, key, shard_paths, partition, shard_count,
     if capped:
         print(f"  NOTE: stopped at --max-records={max_records:,} "
               f"(smoke test, not a full build — do NOT publish).")
-    elif record_index != CORPUS_COUNT:
+    elif record_index != expected_count:
         print(f"  WARNING: parsed {record_index:,} records but expected "
-              f"{CORPUS_COUNT:,} (Check 0). Investigate before publishing.")
+              f"{expected_count:,} (Check 0). Investigate before publishing.")
     return counts, record_index, letters
 
 
@@ -343,7 +345,7 @@ def main():
     ap.add_argument("--partition", choices=["round-robin", "contiguous"],
                     default="round-robin")
     ap.add_argument("--version",
-                    help="version label (default: catalytic_orfs_v1.1_<UTC ts>)")
+                    help="version label (default: <--version-prefix>_<UTC ts>)")
     ap.add_argument("--scratch-dir", default="/mnt/scratch",
                     help="local dir for shard FASTAs + .dmnd (needs ~300 GB)")
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
@@ -364,7 +366,19 @@ def main():
                          "streaming from S3 (avoids S3 GET cost and bandwidth; "
                          "partition logic is identical). --key is still used for "
                          "the manifest corpus field.")
+    ap.add_argument("--expected-count", type=int, default=CORPUS_COUNT,
+                    help="records the corpus must hold (default: v1.1's "
+                         f"{CORPUS_COUNT:,}); a mismatch is flagged before publishing")
+    ap.add_argument("--expected-letters", type=int, default=CORPUS_LETTERS,
+                    help="corpus residues, for the build-plan and zstd block "
+                         "estimates only (the manifest's total_letters is counted)")
+    ap.add_argument("--release",
+                    help="database_release for the manifest (default: parsed "
+                         "from --key, e.g. v1.1)")
+    ap.add_argument("--version-prefix", default="catalytic_orfs_v1.1",
+                    help="build tag prefix; the tag is <prefix>_<UTC ts>")
     args = ap.parse_args()
+    corpus_letters = args.expected_letters
 
     # A --max-records run produces a truncated corpus; never let it become the
     # version workers resolve via LATEST.
@@ -376,9 +390,9 @@ def main():
     # whose -b (= ceil(letters/1e9)) drives Lambda RSS. -b6 OOM'd the 10 GiB tier,
     # so refuse a shard count whose block would need -b >= FASTA_BLOCK_LIMIT.
     if args.format == "zstd":
-        est_shard_letters = CORPUS_LETTERS / args.shard_count
+        est_shard_letters = corpus_letters / args.shard_count
         rec_b = math.ceil(est_shard_letters / 1e9)
-        min_shards = math.ceil(CORPUS_LETTERS / ((FASTA_BLOCK_LIMIT - 1) * 1e9))
+        min_shards = math.ceil(corpus_letters / ((FASTA_BLOCK_LIMIT - 1) * 1e9))
         if rec_b >= FASTA_BLOCK_LIMIT:
             ap.error(
                 f"--format zstd with {args.shard_count} shards needs a single "
@@ -389,10 +403,10 @@ def main():
               f"(~{est_shard_letters/1e9:.1f} Gletters/shard) — fits the 10 GiB tier.")
 
     version = args.version or (
-        "catalytic_orfs_v1.1_"
+        args.version_prefix + "_"
         + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
     scratch = Path(args.scratch_dir)
-    shard_size = math.ceil(CORPUS_COUNT / args.shard_count)
+    shard_size = math.ceil(args.expected_count / args.shard_count)
 
     print("=" * 64)
     print("PETadex DIAMOND shard builder (Phase 1)")
@@ -406,7 +420,7 @@ def main():
           + (f"  (zstd level {args.zstd_level})" if args.format == "zstd" else ""))
     print(f"shards      {args.shard_count}  ({args.partition})")
     print(f"shard_size  {shard_size:,} seqs/shard (contiguous target)")
-    est_letters_per_shard = CORPUS_LETTERS // args.shard_count
+    est_letters_per_shard = corpus_letters // args.shard_count
     need_b = max(1, math.ceil(est_letters_per_shard / LETTERS_PER_B))
     est_rss = RSS_BASE_GB + RSS_PER_B_GB * (need_b - 1)
     print(f"~letters/sh {est_letters_per_shard:,}")
@@ -421,7 +435,7 @@ def main():
         print(f"single-block: workers need DIAMOND_BLOCK_SIZE >= {need_b} "
               f"(-b{need_b}); est peak RSS ~{est_rss:.1f} GB / {LAMBDA_MEM_GB} GB tier")
         if est_rss > LAMBDA_MEM_GB - 1:
-            finer = math.ceil(CORPUS_LETTERS
+            finer = math.ceil(corpus_letters
                               / ((LAMBDA_MEM_GB - 1 - RSS_BASE_GB) / RSS_PER_B_GB + 1)
                               / LETTERS_PER_B)
             print(f"  ⚠️  ~{est_rss:.1f} GB leaves <1 GB headroom under the "
@@ -464,7 +478,8 @@ def main():
     print(f"\n[1/4] Streaming corpus and partitioning into {args.shard_count} shards...")
     counts, total, counted_letters = stream_and_partition(
         s3, args.bucket, args.key, fasta_paths, args.partition, args.shard_count,
-        max_records=args.max_records, local_path=args.local_corpus)
+        max_records=args.max_records, local_path=args.local_corpus,
+        expected_count=args.expected_count)
     for i, c in enumerate(counts):
         print(f"  shard_{i:0{width}d}: {c:,} seqs / {counted_letters[i]:,} letters "
               f"({human(fasta_paths[i].stat().st_size)} FASTA)")
@@ -510,7 +525,7 @@ def main():
         # Semantic corpus release (e.g. "v1.1") — the human-facing DATABASE
         # version, parsed from the corpus filename. Distinct from `version`, the
         # timestamped build tag that pins an exact build of that release.
-        "database_release": database_release(args.key),
+        "database_release": args.release or database_release(args.key),
         "build_date": datetime.now(timezone.utc).isoformat(),
         "corpus": f"s3://{args.bucket}/{args.key}",
         "diamond_version": diamond_version(),
@@ -523,7 +538,7 @@ def main():
         "partition": args.partition,
         "shard_count": args.shard_count,
         "total_sequences": total,
-        "expected_sequences": CORPUS_COUNT,
+        "expected_sequences": args.expected_count,
         # On-disk bytes of the primary artifact (`.dmnd` or `.fasta.zst`). Name kept
         # as *_dmnd_bytes for backward compat; it is the artifact size for any format.
         "total_dmnd_bytes": sum(dmnd_sizes),
