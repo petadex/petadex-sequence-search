@@ -11,8 +11,8 @@ search depth (`maxResults` in the execution input = common.RESULT_DEPTH),
 enriches from RDS once, and writes the result in the UNCHANGED shape the web app
 already consumes — `results/{sessionId}/{jobId}.json` + `results/{sessionId}.index`.
 
-Self-contained (no `lambda_function` import — eager MMseqs2 download). It is the
-only DIAMOND-path component that touches RDS, so `fetch_metadata` lives here.
+It is the only search component that touches RDS, so `fetch_metadata` lives
+here.
 
 Input (the execution state after the Map; see orchestrator.py):
     { "sessionId", "jobId", "queryHeader", "querySequence", "maxResults", ... }
@@ -500,8 +500,7 @@ def handler(event, context):
         # Corpus identity (additive fields; the web app ignores unknown keys).
         # These make a result self-identifying as the DIAMOND/Logan 300M path —
         # `engine: diamond`, the corpus FASTA, the version, and the full DB seq
-        # count — vs the legacy MMseqs2/nr 1M path. See lambda_function.py for
-        # the matching fields on the legacy side.
+        # count — vs the retired legacy MMseqs2/nr 1M path (`engine: mmseqs2`).
         "engine": "diamond",
         "database": event.get("corpus"),
         # Two version axes label every search (see README "Versioning & cache

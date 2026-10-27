@@ -82,4 +82,4 @@ RUN pip install --no-cache-dir -r requirements.txt --target "${LAMBDA_TASK_ROOT}
 COPY src/*.py ${LAMBDA_TASK_ROOT}/
 RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
 
-CMD ["lambda_function.handler"]
+CMD ["worker.handler"]

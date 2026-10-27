@@ -78,7 +78,7 @@ RUN chmod +x ${LAMBDA_TASK_ROOT}/cli.py
 # Default handler: the DIAMOND worker. One image serves all DIAMOND roles —
 # each function overrides this CMD via ImageConfig.Command (orchestrator →
 # `orchestrator.handler`, aggregator → `aggregator.handler`); the worker uses
-# this default. The legacy `lambda_function.py` is still copied above (inert —
-# nothing invokes it now that MMseqs2 is removed) pending full Phase 7 removal.
+# this default. (The legacy MMseqs2 handler `lambda_function.py` was removed
+# 2026-10-27; nothing had invoked it since the 2026-06-03 cutover.)
 # Local CLI (no AWS): docker run --entrypoint python3 -v $PWD:/work image cli.py --db /work/x.dmnd SEQ
 CMD ["worker.handler"]

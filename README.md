@@ -367,7 +367,7 @@ If any shard fails after the Step Functions per-branch retries, the **whole job 
 
 ### Cutover (done — 2026-06-03)
 
-The web app's search invocation was repointed from `petadex-mmseqs2-search` to **`petadex-diamond-orchestrator`** (its role granted `lambda:InvokeFunction` on the orchestrator). Because the contract is preserved, no result-parsing changes were needed; latency rose from ~58 s to ~5 min, so the caller applies a poll timeout / failure state. Remaining cleanup (remove MMseqs2 from the image / `mmseqs2/` prefix) is tracked under Phase 7.
+The web app's search invocation was repointed from `petadex-mmseqs2-search` to **`petadex-diamond-orchestrator`** (its role granted `lambda:InvokeFunction` on the orchestrator). Because the contract is preserved, no result-parsing changes were needed; latency rose from ~58 s to ~5 min, so the caller applies a poll timeout / failure state. The legacy function, its code and the MMseqs2 binary have since been removed (below).
 
 ### Legacy MMseqs2 path
 
@@ -377,7 +377,7 @@ The original implementation was a single ARM64 container Lambda (`petadex-mmseqs
 2. Runs `mmseqs easy-search` against the index.
 3. Enriches hits from RDS and uploads the result JSON to `results/{sessionId}/{job_id}.json` in the same schema.
 
-This path (`src/lambda_function.py`; its index builder `scripts/db/update_sequence_index.py` was removed 2026-10-26) **no longer serves the web app** — the cutover to DIAMOND completed 2026-06-03, and the `mmseqs` binary left the image on 2026-06-26 (the legacy function stays frozen on its last MMseqs2 image). Phase 7 removes the remaining legacy code paths and the `mmseqs2/` S3 prefix once parity is reconfirmed. Its results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2` so they remain self-identifying if encountered.
+**Retired.** The cutover to DIAMOND completed 2026-06-03 and the `mmseqs` binary left the image on 2026-06-26. The index builder (`scripts/db/update_sequence_index.py`) was removed 2026-10-26; the `petadex-mmseqs2-search` Lambda was deleted and its handler (`src/lambda_function.py`) removed 2026-10-27 (all in git history; function config backups in `/franklin/rnalab1/dzhu/petadex-v260701-search/lambda_backup_20261026/`). What remains is the `s3://petadex/mmseqs2/` prefix. Old results carry `engine: mmseqs2` / `search_version: legacy-mmseqs2`, so they stay self-identifying if encountered.
 
 ---
 
@@ -392,7 +392,6 @@ petadex-sequence-search/
 │   ├── worker.py                 # DIAMOND: download one shard, run diamond blastp, write TSV part
 │   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
 │   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
-│   ├── lambda_function.py        # Legacy single-Lambda MMseqs2 handler (no longer serving)
 │   └── cli.py                    # Local DIAMOND search against any local DB (no AWS; JSON to stdout)
 ├── data/
 │   └── example-sequences.txt     # IsPETase, FAST-PETase, SRR10663367 — regenerated on every deploy

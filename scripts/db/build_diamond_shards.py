@@ -81,7 +81,7 @@ RSS_PER_B_GB = 1.38               # additional RSS per unit -b above 1
 LAMBDA_MEM_GB = 10                # worker Lambda max memory tier (§10.6)
 WORKER_RESERVED_CONCURRENCY = 100  # worker reserved concurrency (provision_diamond_infra.sh, §10.6)
 
-# Mirror the multipart tuning the Lambda download path uses (lambda_function.py).
+# Mirror the multipart tuning the worker's shard download uses (worker.py).
 S3_TRANSFER_CONFIG = TransferConfig(
     multipart_chunksize=32 * 1024 * 1024,
     max_concurrency=32,

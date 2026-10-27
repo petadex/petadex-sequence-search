@@ -2,15 +2,10 @@
 """
 Shared, side-effect-free helpers for the PETadex search path.
 
-These are the query-contract functions (FASTA parsing + validation) that BOTH
-the orchestrator and the legacy Lambda must apply identically. They live here —
-rather than being imported from `lambda_function.py` — because that module
-eager-downloads the 3.2 GB MMseqs2 database at import time, which the DIAMOND
-orchestrator/worker must never trigger.
-
-During the transition `lambda_function.py` keeps its own inline copies (leaving
-the live path untouched); at Phase 7 cutover that module is deleted and this
-becomes the single source of truth. Keep the two in sync until then.
+These are the query-contract functions (FASTA parsing + validation) plus the
+shared constants of the search and export contracts. This module is the single
+source of truth for them; the legacy MMseqs2 handler that kept inline copies
+(`lambda_function.py`) was removed 2026-10-27.
 """
 
 import re

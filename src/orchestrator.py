@@ -8,9 +8,7 @@ and kicks off a Step Functions execution that fans out one worker per shard
 (Phase 4 Map) and aggregates. It returns `{ job_id, s3_key }` immediately and
 NEVER block-waits — the web-app contract is unchanged.
 
-Self-contained on purpose: it does NOT import `lambda_function.py` (that module
-eager-downloads the 3.2 GB MMseqs2 DB at import). Query-contract helpers come
-from `common.py`.
+Query-contract helpers come from `common.py`.
 
 Event (web-app contract, unchanged):
     { "action": "search", "sessionId": "...", "sequence": "...", "max_results": 50 }

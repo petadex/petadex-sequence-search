@@ -6,11 +6,8 @@ One worker searches ONE shard of the sharded DIAMOND database and writes its
 partial result to S3. The orchestrator (Phase 3) fans out one worker per shard
 via Step Functions Map; the aggregator (Phase 4) merges the parts.
 
-This handler is deliberately self-contained — it does NOT import
-`lambda_function`, because that module eager-downloads the 3.2 GB MMseqs2 DB at
-import time (for the legacy single-Lambda path). A worker never touches MMseqs2.
-One container image serves both roles; the worker Lambda just binds its CMD to
-`worker.handler` instead of `lambda_function.handler`.
+One container image serves the orchestrator, worker and aggregator; the worker
+Lambda uses the image's default CMD, `worker.handler`.
 
 Input event (query pre-validated and version pinned by the orchestrator):
     {
