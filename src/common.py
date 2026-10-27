@@ -42,7 +42,14 @@ import re
 #           stored payload now holds RESULT_DEPTH rows instead of the caller's
 #           count, so this MUST bump: without it a cached 50-hit result would
 #           keep being served to a request that asks for 200.
-SEARCH_VERSION = "1.4.0"
+#   1.5.0 — Hits carry v260701 metadata: the aggregator looks every hit up in
+#           the metadata store (METADATA_STORE, scripts/db/build_metadata_store.py)
+#           instead of the RDS blast_nr_metadata join, which never matched a
+#           v260701 id. Each hit's `metadata` is its card; the result gains
+#           `enrichment_status`, `metadata_version`, `clusters` and `summary`.
+#           Same hits and ranking, different payload, so this MUST bump: a cached
+#           1.4.0 result has `metadata: null` on every hit.
+SEARCH_VERSION = "1.5.0"
 
 # Depth of the SEARCH itself — how many hits every job computes and stores,
 # regardless of how many the caller asks to display. Set once here, injected by

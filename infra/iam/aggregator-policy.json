@@ -27,10 +27,10 @@
       "Resource": "arn:aws:s3:::petadex/results/*"
     },
     {
-      "Sid": "ReadDbSecret",
+      "Sid": "ReadMetadataStore",
       "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": "REPLACE_DB_SECRET_ARN"
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::petadex/metadata/*"
     }
   ]
 }

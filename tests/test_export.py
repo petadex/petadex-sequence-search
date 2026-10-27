@@ -214,7 +214,7 @@ def run_export_aggregator(meta_hits):
         import aggregator
     aggregator.s3 = s3
     aggregator.EXPORT_DIR = tempfile.mkdtemp() + "/export"
-    aggregator.fetch_metadata = lambda ids: (_ for _ in ()).throw(AssertionError("export must not hit RDS"))
+    aggregator.metadata.enrich = lambda *a, **k: (_ for _ in ()).throw(AssertionError("export must not enrich"))
     ret = aggregator.handler({
         "sessionId": SID + "_x", "jobId": "J", "querySequence": SEQ, "queryHeader": "q1",
         "maxResults": 0, "shards": [{"shardIndex": i} for i in range(n_shards)],

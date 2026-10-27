@@ -53,7 +53,6 @@ with mock.patch("boto3.client", return_value=S3Stub()):
     import worker  # noqa: E402
     import aggregator  # noqa: E402
 worker.s3 = aggregator.s3 = S3Stub()
-aggregator.fetch_metadata = lambda ids: {}
 
 SHARDS = [f"{E2E}/half_0.fa.zst", f"{E2E}/half_1.fa.zst"]
 DBSIZE = 88181580142

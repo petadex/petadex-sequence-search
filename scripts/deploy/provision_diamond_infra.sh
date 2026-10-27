@@ -18,9 +18,11 @@
 #     provisions fine but cannot serve a query until the database exists).
 #   * Does NOT touch the legacy petadex-mmseqs2-search function or mmseqs2/ path.
 #
-# REQUIRED env:
-#   DB_SECRET_ARN   Secrets Manager ARN of the RDS credentials (aggregator).
 # OPTIONAL env:
+#   METADATA_STORE  s3:// prefix of the metadata store the aggregator enriches hits
+#                   from (scripts/db/build_metadata_store.py). Unset = no enrichment.
+#   SAMPLES_STORE   s3:// prefix of the "Found in Samples" store the orchestrator's
+#                   `samples` action reads (scripts/db/build_samples_store.py).
 #   IMAGE_URI       Full ECR image URI (default: <acct>.dkr.ecr.<region>.amazonaws.com/petadex-mmseq2-search:latest)
 #   VPC_SUBNET_IDS  Comma-separated subnet IDs for the aggregator (to reach RDS).
 #   VPC_SG_IDS      Comma-separated security group IDs for the aggregator.
@@ -56,7 +58,6 @@ SM_NAME="petadex-diamond-search"
 GHA_ROLE="${GHA_ROLE:-petadex-github-actions-role}"  # pre-existing CI role
 SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${SM_NAME}"
 
-: "${DB_SECRET_ARN:?set DB_SECRET_ARN to the RDS credentials secret ARN}"
 
 IAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra/iam" && pwd)"
 ASL_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra" && pwd)/search_state_machine.asl.json"
@@ -80,12 +81,10 @@ ensure_role() {  # name  trust-file  policy-name  policy-file
 }
 
 echo "[1/4] IAM roles"
-# Policy files use REPLACE_ACCOUNT_ID (and the aggregator REPLACE_DB_SECRET_ARN)
-# as placeholders so no real account ID is committed — substitute into temp copies.
+# Policy files use REPLACE_ACCOUNT_ID as a placeholder so no real account ID is
+# committed — substitute into temp copies.
 for f in aggregator-policy orchestrator-policy worker-policy statemachine-policy github-actions-lambda-invoke; do
-  sed -e "s|REPLACE_ACCOUNT_ID|${ACCOUNT_ID}|g" \
-      -e "s|REPLACE_DB_SECRET_ARN|${DB_SECRET_ARN}|g" \
-      "$IAM_DIR/$f.json" > "$TMP/$f.json"
+  sed -e "s|REPLACE_ACCOUNT_ID|${ACCOUNT_ID}|g" "$IAM_DIR/$f.json" > "$TMP/$f.json"
 done
 
 ensure_role "${ORCH_FN}-role"   "$IAM_DIR/lambda-trust.json"       orchestrator-policy "$TMP/orchestrator-policy.json"
@@ -147,7 +146,7 @@ ensure_function() {  # name role-arn handler memory timeout 'ephemeral' 'env' [v
 
 echo "[2/4] Lambda functions (one image, three handlers)"
 ensure_function "$ORCH_FN" "$ORCH_ROLE_ARN" orchestrator.handler 512 30 512 \
-  "Variables={S3_BUCKET=petadex,STATE_MACHINE_ARN=$SM_ARN}"
+  "Variables={S3_BUCKET=petadex,STATE_MACHINE_ARN=$SM_ARN,SAMPLES_STORE=${SAMPLES_STORE:-}}"
 
 # Memory 10240 (Lambda max ≈ 6 vCPU): DIAMOND search is CPU-bound and uses
 # THREADS=os.cpu_count(), so vCPU count — not RSS — sets search wall time.
@@ -169,7 +168,7 @@ if [[ -n "${VPC_SUBNET_IDS:-}" ]]; then
   AGG_VPC="SubnetIds=${VPC_SUBNET_IDS},SecurityGroupIds=${VPC_SG_IDS:?set VPC_SG_IDS too}"
 fi
 ensure_function "$AGG_FN" "$AGG_ROLE_ARN" aggregator.handler 1024 120 512 \
-  "Variables={S3_BUCKET=petadex,DB_NAME=petadex,DB_HOST=petadex.ccz9y6yshbls.us-east-1.rds.amazonaws.com,DB_SECRET_ARN=$DB_SECRET_ARN}" \
+  "Variables={S3_BUCKET=petadex,METADATA_STORE=${METADATA_STORE:-}}" \
   "$AGG_VPC"
 
 echo "[3/4] Step Functions state machine"

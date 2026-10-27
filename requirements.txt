@@ -1,4 +1,3 @@
 boto3
-psycopg2-binary==2.9.11
 biopython==1.83
 numpy<2.0.0
