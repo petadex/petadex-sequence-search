@@ -143,7 +143,7 @@ results/{sessionId}/{jobId}/parts/shard_N.meta.json# per-shard timing sidecar
 results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 ```
 
-The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `result_depth`, `db_sequence_count`. Note Logan target IDs are ORF IDs (not GenBank accessions), so `metadata` is typically `null` for Logan hits.
+The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `result_depth`, `db_sequence_count`. Since `search_version` 1.5.0 each hit's `metadata` is its card from the metadata store (see [Metadata enrichment](#metadata-enrichment)), and the result adds `enrichment_status`, `metadata_version`, `clusters` and `summary`.
 
 Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
 
@@ -337,6 +337,17 @@ Export format `common.EXPORT_FORMAT_VERSION` (1.1):
 
 **Cost.** Per shard, an uncapped search took 1.2–2.2× the capped one (watson, 6 threads). Live (format 1.0): typical exports cost about the same as a search (~$0.17, ~46 s); the largest family (7.9M hits) 158 s, $0.34. With sequences the largest export is ~1.4 GB of FASTA; the aggregator runs at 2,048 MB, 600 s timeout, 6,144 MB `/tmp` (peak ~3.1 GB: parts + outputs). Tests: `tests/test_export.py`.
 
+### Metadata enrichment
+
+The aggregator enriches the top hits from a **metadata store** in S3 (`METADATA_STORE`, e.g. `s3://petadex/metadata/v260701/<tag>`), built from the v260701 metadata by [`scripts/db/build_metadata_store.py`](scripts/db/build_metadata_store.py) and read by [`src/metadata.py`](src/metadata.py). It replaces the RDS `blast_nr_metadata` join, which matched GenBank accessions and so never matched a v260701 id; the search no longer touches RDS.
+
+- **Layout.** One JSON card per searchable sequence (298,687,346: PL / NR / LG) and per cluster (90 / 60 / 30 %), in gzipped NDJSON blocks of 2,000 rows with a sorted `index.json`. A search groups its hit ids by block and fetches only those blocks, in parallel; every line starts with `{"id":"<key>",`, so unwanted lines are skipped unparsed.
+- **Result fields.** Each hit's `metadata` is its card (clusters, and per origin: Plasticome name / substrates / EC / organism; nr organism, lineage, genomes, BacDive optimum; Logan BioSample / study / run counts, support tier, environment profile and its histogram, measured and inferred temperature / pH). The result adds `clusters` (cards of the hits' clusters), `summary` (counts by origin; environments per Logan sequence against a random corpus Logan sequence, as `x_expected`; the clusters the hits fall into) and `metadata_version` (the store tag).
+- **`enrichment_status`.** `ok` (every hit has a card), `partial` (some ids not in the store), `failed` (the lookup raised; the hits are still returned) or `unavailable` (no store configured, or a store for another `database_release`, e.g. a search pinned to v1.1).
+- **Found in Samples.** The orchestrator's stateless `samples` action (`{"action": "samples", "id": "LG…"}`) returns the BioSamples one Logan sequence was assembled in, from a second store (`SAMPLES_STORE`, [`scripts/db/build_samples_store.py`](scripts/db/build_samples_store.py)): up to 200 by run count with the true total, each with its study title, environment fields and the sample's most abundant species by NCBI read classification.
+- **Examples.** A real 1.5.0 result (ISPETase, 500 hits) and a `samples` response are in [`tests/fixtures/`](tests/fixtures/).
+- **Versioning.** A new store build changes the payload for the same hits, so pointing `METADATA_STORE` at a new store should come with a `SEARCH_VERSION` bump, exactly as a sensitivity change does.
+
 ### Cleanup & lifecycle
 
 Each search writes an immutable, `jobId`-addressed result tree under `results/{sessionId}/{jobId}/`, and `results/{sessionId}.index` is overwritten to point at the newest `jobId`. Nothing garbage-collects the previous `jobId` trees, and version-aware re-keying (above) deliberately orphans every prior `sessionId` — so without reaping, the bulky per-shard `parts/*.tsv` + `*.meta.json` and `timing.json` accumulate indefinitely.
@@ -391,6 +402,7 @@ petadex-sequence-search/
 │   ├── worker.py                 # DIAMOND: download one shard, run diamond blastp, write TSV part
 │   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
 │   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
+│   ├── metadata.py               # Tier-A enrichment: hit cards + summary from the metadata store
 │   └── cli.py                    # Local DIAMOND search against any local DB (no AWS; JSON to stdout)
 ├── data/
 │   └── example-sequences.txt     # IsPETase, FAST-PETase, SRR10663367 — regenerated on every deploy
@@ -402,6 +414,7 @@ petadex-sequence-search/
 │   ├── db/                       # Build & maintain the sharded database
 │   │   ├── build_diamond_shards.py       # Builds the sharded DIAMOND DB from a corpus FASTA (zstd shards build on any Linux box)
 │   │   ├── assemble_v260701_corpus.py    # v260701 full-length + core corpora (>petadex_id headers)
+│   │   ├── build_metadata_store.py       # v260701 metadata store for enrichment (runs on EC2)
 │   │   ├── verify_v260701_corpus.sh      # Record-by-record check of those corpora against the source files
 │   │   ├── run_v260701_rebuild.sh        # Unattended v260701 run: verify → build/upload → checks → pinned validation
 │   │   ├── backfill_manifest_letters.py  # Populate manifest total_letters (e-value --dbsize) without a rebuild
@@ -530,7 +543,7 @@ One ARM64 image serves all roles. Pushes to `main` build and deploy via GitHub A
 
 **One-time provisioning** (admin IAM, not the CI/build role) creates the 3 DIAMOND Lambdas, the `petadex-diamond-search` state machine, and their IAM roles from the same image:
 ```bash
-DB_SECRET_ARN=<rds-secret-arn> ./scripts/deploy/provision_diamond_infra.sh
+METADATA_STORE=s3://petadex/metadata/v260701/<tag> ./scripts/deploy/provision_diamond_infra.sh
 ```
 
 Manual code update (per function):
