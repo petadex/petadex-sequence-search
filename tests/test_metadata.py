@@ -179,6 +179,13 @@ with mock.patch("boto3.client", return_value=mock.MagicMock()):
 with mock.patch.dict(os.environ, {"SAMPLES_STORE": sroot}):
     ok = orchestrator.handler({"action": "samples", "id": "LG7"}, None)
     bad = orchestrator.handler({"action": "samples", "id": "nonsense"}, None)
+    missing = orchestrator.handler({"action": "samples", "id": "LG8"}, None)
+    notlg = orchestrator.handler({"action": "samples", "id": "NR5"}, None)
+with mock.patch.dict(os.environ, {"SAMPLES_STORE": ""}):
+    nostore = orchestrator.handler({"action": "samples", "id": "LG7"}, None)
+check("not_found -> 404", missing["statusCode"] == 404, missing.get("statusCode"))
+check("non-Logan id -> 400", notlg["statusCode"] == 400, notlg.get("statusCode"))
+check("no store configured -> 503", nostore["statusCode"] == 503, nostore.get("statusCode"))
 check("orchestrator samples action -> 200", ok["statusCode"] == 200 and json.loads(ok["body"])["samples"][0]["biosample"] == "SAMN2", ok.get("statusCode"))
 check("orchestrator rejects a malformed id with 400", bad["statusCode"] == 400, bad.get("statusCode"))
 

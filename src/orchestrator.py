@@ -414,12 +414,16 @@ def handler(event, context):
             return _resp(200, get_versions(body.get("version")))
 
         # Stateless per-sequence lookup for the sequence page ("Found in Samples");
-        # no search, no sessionId. A malformed id is the caller's error (400).
+        # no search, no sessionId. The lookup's status maps to the HTTP status the
+        # petadex.io route relays: ok 200, not_found 404 (a Logan id with no linked
+        # BioSample), not_applicable / malformed id 400, unavailable 503 (no store).
         if action == "samples":
             try:
-                return _resp(200, metadata.samples(body.get("id")))
+                res = metadata.samples(body.get("id"))
             except ValueError as e:
                 return _resp(400, {"error": str(e)})
+            code = {"ok": 200, "not_found": 404, "not_applicable": 400}.get(res["status"], 503)
+            return _resp(code, res)
 
         session_id = body.get("sessionId")
         if not session_id:
