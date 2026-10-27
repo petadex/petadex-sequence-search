@@ -331,6 +331,8 @@ The search stops at `RESULT_DEPTH` per shard, so DIAMOND never computes the rest
 
 `hits.tsv.gz` (format `common.EXPORT_FORMAT_VERSION`, 1.0): commented `#` provenance lines (query, `database_release`/`database_version`, `search_version`, e-value cutoff, `dbsize`, `total_hits`, time), then a column row `rank target_id origin pident aln_len qstart qend sstart send slen evalue bitscore`, then one row per hit. The header is its own gzip member in front of the data member; `gzip`/`zcat`/pandas/R read that as one file. The summary JSON carries `total_hits`, `by_evalue` (hits at or below 1e-3/1e-10/1e-30/1e-50), `by_origin` (plasticome/ncbi_nr/logan from the `petadex_id` prefix) and the file key.
 
+**The export is the exact ranking; the search is very slightly approximate.** DIAMOND's `-k` is a heuristic: a capped run can skip a hit that belongs in its top K. In the end-to-end check on two real shards (`scripts/bench/export_e2e.py`, 2026-10-27), the search's top 500 for IsPETase missed one true top-500 hit (true rank 344, 220 bits; the top 100 was complete); five other queries matched exactly. Every hit the search returns is in the export with the same score.
+
 **Cost.** Per shard, an uncapped search took 1.2–2.2× the capped one (watson, 6 threads). The aggregator merge of the largest family measured 7.9M rows in ~50–100 s on one watson core, so the aggregator needs more than its 1,024 MB / 120 s for exports (planned: 2,048 MB, 600 s). Tests: `tests/test_export.py`.
 
 ### Cleanup & lifecycle

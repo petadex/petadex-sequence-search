@@ -19,7 +19,7 @@ Building, validating and operating the sharded DIAMOND search database.
 - **[smoke_test.sh](deploy/smoke_test.sh)** - one search end to end through the live orchestrator
 - **[validate_pinned_version.py](deploy/validate_pinned_version.py)** - runs the site examples pinned to a version and against `LATEST`; fails on any hit from the wrong version
 
-**Benchmarks (`bench/`)** - `bench_full_vs_cores.sh` (search DB choice), `bench_result_depth.py`, and the Stage 2/3 dev-build runbooks.
+**Benchmarks (`bench/`)** - `bench_full_vs_cores.sh` (search DB choice), `bench_result_depth.py`, `export_e2e.py` (export vs search on real shards, no AWS), and the Stage 2/3 dev-build runbooks.
 
 **Operations (`ops/`)**
 - **[setup_search_alarms.sh](ops/setup_search_alarms.sh)** - creates/updates the search CloudWatch alarms and their SNS → ntfy relay (idempotent; `--test` sends one push)
