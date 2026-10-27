@@ -4,13 +4,19 @@
     {
       "Sid": "Logs",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
       "Resource": "arn:aws:logs:us-east-1:REPLACE_ACCOUNT_ID:*"
     },
     {
       "Sid": "ReadDiamondPointers",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
+      "Action": [
+        "s3:GetObject"
+      ],
       "Resource": [
         "arn:aws:s3:::petadex/diamond/LATEST",
         "arn:aws:s3:::petadex/diamond/*/manifest.json"
@@ -19,15 +25,32 @@
     {
       "Sid": "ListResultsForHistory",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": [
+        "s3:ListBucket"
+      ],
       "Resource": "arn:aws:s3:::petadex",
-      "Condition": { "StringLike": { "s3:prefix": "results/*" } }
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "results/*"
+        }
+      }
     },
     {
       "Sid": "StartSearchExecution",
       "Effect": "Allow",
-      "Action": ["states:StartExecution", "states:ListExecutions"],
+      "Action": [
+        "states:StartExecution",
+        "states:ListExecutions"
+      ],
       "Resource": "arn:aws:states:us-east-1:REPLACE_ACCOUNT_ID:stateMachine:petadex-diamond-search"
+    },
+    {
+      "Sid": "ReadSamplesStore",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::petadex/metadata/*"
     }
   ]
 }

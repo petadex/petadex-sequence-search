@@ -14,6 +14,8 @@ Event (web-app contract, unchanged):
     { "action": "search", "sessionId": "...", "sequence": "...", "max_results": 50 }
     { "action": "history", "sessionId": "..." }
     { "action": "version" }
+    { "action": "samples", "id": "LG113721682" }   -> "Found in Samples" for one
+        Logan sequence (metadata.samples; SAMPLES_STORE). Stateless, like version.
 
 The petadex.io backend also sends `clientIp` on search. Its presence marks a
 public search, which must pass `check_admission` (rate and concurrency limits)
@@ -57,6 +59,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
+import metadata
 from common import (EXPORT_DEPTH, RESULT_DEPTH, SEARCH_VERSION,
                     export_session_id, parse_database_release, parse_fasta,
                     validate_sequence)
@@ -409,6 +412,14 @@ def handler(event, context):
         # be circular. See get_versions / README "Versioning & cache invalidation".
         if action == "version":
             return _resp(200, get_versions(body.get("version")))
+
+        # Stateless per-sequence lookup for the sequence page ("Found in Samples");
+        # no search, no sessionId. A malformed id is the caller's error (400).
+        if action == "samples":
+            try:
+                return _resp(200, metadata.samples(body.get("id")))
+            except ValueError as e:
+                return _resp(400, {"error": str(e)})
 
         session_id = body.get("sessionId")
         if not session_id:
