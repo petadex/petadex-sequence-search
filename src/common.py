@@ -76,6 +76,64 @@ SEARCH_VERSION = "1.4.0"
 # an unbounded payload, and since 1.3.0 every hit carries a full protein.
 RESULT_DEPTH = 500
 
+# --- Export of ALL significant hits (on demand, separate from the search) ---
+#
+# The search above stops at RESULT_DEPTH per shard, so DIAMOND never computes
+# the rest. An export re-runs the fan-out with no hit cap (`-k 0`) and a light
+# output (no sequences), and the aggregator merges the 32 sorted parts into one
+# gzipped TSV plus a summary of counts. Measured on one v260701 shard: ~31k hits
+# (SRR10663367) to ~7.9M (a C003 query) at e <= 1e-3, at 1.2-2.2x the capped
+# search time — why it is opt-in rather than part of every search.
+#
+# EXPORT_DEPTH rides the existing `maxResults` field through the state machine
+# (0 = DIAMOND's "no limit"), so exports need no ASL change. The orchestrator
+# injects it; nothing else ever produces maxResults == 0.
+EXPORT_DEPTH = 0
+# Exports run under their own sessionId so a failed export writes its own
+# `.error` sentinel instead of failing the search it belongs to. Two characters
+# because public execution names (`{tag}_{sessionId}-{jobId}`) must fit in 80.
+EXPORT_SESSION_SUFFIX = "_x"
+# Version of the export file format (columns, header, summary), stamped into
+# every summary. Bump when a column or the summary shape changes.
+EXPORT_FORMAT_VERSION = "1.0"
+# DIAMOND columns the worker writes for an export part, in this order.
+EXPORT_OUTFMT = ["sseqid", "qstart", "qend", "sstart", "send", "length",
+                 "pident", "evalue", "bitscore", "slen"]
+# Columns of the merged file: rank + target id + origin, then the alignment.
+EXPORT_COLUMNS = ["rank", "target_id", "origin", "pident", "aln_len", "qstart",
+                  "qend", "sstart", "send", "slen", "evalue", "bitscore"]
+# E-value bands reported in the summary (hits at or below each).
+EXPORT_EVALUE_BANDS = (1e-3, 1e-10, 1e-30, 1e-50)
+_ORIGIN_BY_PREFIX = {"PL": "plasticome", "NR": "ncbi_nr", "LG": "logan"}
+
+
+def export_rank_key(fields):
+    """Sort key for export rows: the search's own ranking (bitscore desc, then
+    e-value asc, as aggregator.handler ranks), then target id so ties are stable.
+    `fields` is an EXPORT_OUTFMT row: bitscore = [8], evalue = [7], sseqid = [0]."""
+    return (-float(fields[8]), float(fields[7]), fields[0])
+
+
+def sort_export_rows(tsv):
+    """Sort an export part's outfmt-6 text by export_rank_key; returns text."""
+    rows = [line.split("\t") for line in tsv.splitlines() if line.strip()]
+    rows.sort(key=export_rank_key)
+    return "".join("\t".join(r) + "\n" for r in rows)
+
+
+def export_session_id(session_id):
+    """sessionId an export of `session_id` runs (and is stored) under."""
+    return f"{session_id}{EXPORT_SESSION_SUFFIX}"
+
+
+def hit_origin(target_id):
+    """Source of a hit from its v260701 petadex_id prefix (PL/NR/LG + digits).
+    v1.1-format IDs (`orf||run|…`) carry no prefix and return "unknown"."""
+    prefix, rest = target_id[:2], target_id[2:]
+    if prefix in _ORIGIN_BY_PREFIX and rest.isdigit():
+        return _ORIGIN_BY_PREFIX[prefix]
+    return "unknown"
+
 # Valid amino acid characters accepted by the search pipeline.
 # Includes the 20 standard AAs plus IUPAC ambiguity codes DIAMOND handles natively.
 # Stop codons (*) and gap characters (-) are stripped before this check.

@@ -59,8 +59,9 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
-from common import (RESULT_DEPTH, SEARCH_VERSION, parse_database_release,
-                    parse_fasta, validate_sequence)
+from common import (EXPORT_DEPTH, RESULT_DEPTH, SEARCH_VERSION,
+                    export_session_id, parse_database_release, parse_fasta,
+                    validate_sequence)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 DIAMOND_PREFIX = "diamond"
@@ -296,6 +297,28 @@ def start_search(session_id, job_id, version, query_header, query_sequence,
     )
 
 
+def find_export(export_sid):
+    """Return the response for a finished export under `export_sid`, or None.
+
+    A finished export is a `results/{export_sid}/{jobId}.json` summary whose
+    `hits.tsv.gz` still exists (both expire after 14 days, see aggregator
+    handle_export). Listing only: the orchestrator role can list the bucket but
+    not read results, so the caller (the petadex.io backend) reads the summary
+    and presigns the download.
+    """
+    prefix = f"results/{export_sid}/"
+    page = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/")
+    done = sorted((o for o in page.get("Contents", []) if o["Key"].endswith(".json")),
+                  key=lambda o: o["LastModified"], reverse=True)
+    for obj in done:
+        job_id = obj["Key"][len(prefix):-len(".json")]
+        hits_key = f"{prefix}{job_id}/hits.tsv.gz"
+        if s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=hits_key).get("KeyCount"):
+            return {"status": "ready", "job_id": job_id, "s3_key": obj["Key"],
+                    "hits_key": hits_key, "export_session_id": export_sid}
+    return None
+
+
 def get_versions(requested=None):
     """Resolve the version identifiers a FRESH search would run with.
 
@@ -390,6 +413,19 @@ def handler(event, context):
         if action == "history":
             return _resp(200, {"history": get_history(session_id)})
 
+        # --- export: every significant hit, on demand (common.EXPORT_DEPTH) ---
+        # Same request as a search (sessionId = the search's cache key). A
+        # finished export is returned as-is; otherwise the search path below runs
+        # uncapped under the export's own sessionId, with the same validation,
+        # admission limits and in-flight dedup.
+        is_export = action == "export"
+        if is_export:
+            session_id = export_session_id(session_id)
+            ready = find_export(session_id)
+            if ready:
+                print(f"Export cache hit: {ready['job_id']} (sessionId={session_id})")
+                return _resp(200, ready)
+
         # --- search ---
         raw_input = body.get("sequence", "").strip()
         # The caller's `max_results` is accepted (the request contract is
@@ -399,7 +435,7 @@ def handler(event, context):
         # fresh 32-shard fan-out — see common.RESULT_DEPTH and the vault note
         # "12 Variable Result Count".
         requested_display = body.get("max_results")
-        max_results = RESULT_DEPTH
+        max_results = EXPORT_DEPTH if is_export else RESULT_DEPTH
         if requested_display is not None:
             print(f"max_results={requested_display} is presentational; "
                   f"searching to RESULT_DEPTH={RESULT_DEPTH}")
@@ -448,6 +484,8 @@ def handler(event, context):
                     "job_id": inflight,
                     "s3_key": f"results/{session_id}/{inflight}.json",
                     "deduped": True,
+                    **({"status": "running", "export_session_id": session_id}
+                       if is_export else {}),
                 })
 
         job_id = str(uuid.uuid4())
@@ -469,6 +507,8 @@ def handler(event, context):
         return _resp(200, {
             "job_id": job_id,
             "s3_key": f"results/{session_id}/{job_id}.json",
+            **({"status": "running", "export_session_id": session_id}
+               if is_export else {}),
         })
 
     except AdmissionDenied as e:

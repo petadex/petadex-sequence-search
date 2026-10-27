@@ -40,6 +40,7 @@ worker emits the raw column untouched; the assertion lives in the merger.
 """
 
 import glob
+import gzip
 import json
 import math
 import os
@@ -50,6 +51,8 @@ from datetime import datetime, timezone
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config as BotoConfig
+
+from common import EXPORT_DEPTH, EXPORT_OUTFMT, sort_export_rows
 
 S3_BUCKET = "petadex"
 
@@ -327,7 +330,10 @@ def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None,
             n = 0
         if n > 0:
             cmd += ["--dbsize", str(n)]
-    cmd += ["--outfmt", *OUTFMT]
+    # An export (max_results == EXPORT_DEPTH == 0, i.e. `-k 0`) can return
+    # hundreds of thousands of hits per shard, so it drops the sequence column.
+    outfmt = ["6", *EXPORT_OUTFMT] if max_results == EXPORT_DEPTH else OUTFMT
+    cmd += ["--outfmt", *outfmt]
     print(f"$ {' '.join(cmd)}")
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -424,13 +430,22 @@ def handler(event, context):
 
         n_hits = tsv.count("\n") if tsv else 0
         timings["num_hits"] = n_hits
-        part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv"
+        if max_results == EXPORT_DEPTH:
+            # Export part: rows sorted by the aggregator's global rank key so it
+            # can stream-merge 32 parts; gzipped (~4x smaller, up to ~17 MB raw).
+            part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv.gz"
+            body = gzip.compress(sort_export_rows(tsv).encode(), compresslevel=6)
+            content_type = "application/gzip"
+        else:
+            part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv"
+            body = tsv.encode()
+            content_type = "text/tab-separated-values"
         # reapable=true: parts are write-once-then-dead once {jobId}.json exists
         # (web app never re-reads them), so a tag-scoped lifecycle rule can expire
         # them without ever touching the authoritative result. Requires
         # s3:PutObjectTagging in the worker IAM (see infra/iam/worker-policy.json).
-        s3.put_object(Bucket=S3_BUCKET, Key=part_key, Body=tsv.encode(),
-                      ContentType="text/tab-separated-values",
+        s3.put_object(Bucket=S3_BUCKET, Key=part_key, Body=body,
+                      ContentType=content_type,
                       Tagging="reapable=true")
         print(f"wrote {n_hits} hits -> s3://{S3_BUCKET}/{part_key}")
 

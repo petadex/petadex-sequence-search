@@ -29,12 +29,19 @@ corpus. The contract already permits `metadata: null`; the round-trip is kept
 per the plan. A real Logan-corpus metadata source is a separate, future concern.
 """
 
+import gzip
+import heapq
+import io
 import json
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 
 import boto3
+
+from common import (EXPORT_COLUMNS, EXPORT_DEPTH, EXPORT_EVALUE_BANDS,
+                    EXPORT_FORMAT_VERSION, export_rank_key, hit_origin)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 DB_HOST = os.environ.get("DB_HOST", "petadex.ccz9y6yshbls.us-east-1.rds.amazonaws.com")
@@ -136,6 +143,154 @@ def read_parts(session_id, job_id):
             body = s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read()
             results.extend(parse_part(body.decode()))
     return results, n_parts
+
+
+def read_export_parts(session_id, job_id):
+    """Download every export part (`parts/shard_*.tsv.gz`) into memory.
+
+    Parts are the worker's gzipped, rank-sorted rows (common.EXPORT_OUTFMT);
+    the largest measured family is ~4 MB per part compressed. Returns the list
+    of compressed bodies (one per shard) for `merge_export`.
+    """
+    prefix = f"results/{session_id}/{job_id}/parts/"
+    paginator = s3.get_paginator("list_objects_v2")
+    bodies = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".tsv.gz"):
+                bodies.append(s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read())
+    return bodies
+
+
+def _export_rows(body):
+    """Yield the split rows of one gzipped export part."""
+    with gzip.open(io.BytesIO(body), "rt") as f:
+        for line in f:
+            if line.strip():
+                yield line.rstrip("\n").split("\t")
+
+
+def merge_export(bodies, out_path):
+    """Stream-merge rank-sorted export parts into one gzipped TSV of ranked rows.
+
+    Each part is already sorted by common.export_rank_key, so a k-way heap merge
+    yields the global order without holding the hit set in memory. Writes the
+    data rows (EXPORT_COLUMNS) to `out_path`, header excluded — it needs the
+    total, which is only known at the end. Returns (total, counts) where counts
+    has `by_evalue` (hits at or below each band) and `by_origin`.
+    """
+    by_evalue = {band: 0 for band in EXPORT_EVALUE_BANDS}
+    by_origin = {}
+    total = 0
+    merged = heapq.merge(*(_export_rows(b) for b in bodies), key=export_rank_key)
+    with gzip.open(out_path, "wt", compresslevel=6) as out:
+        for f in merged:
+            sseqid, qstart, qend, sstart, send, length, pident, evalue, bitscore, slen = f
+            total += 1
+            origin = hit_origin(sseqid)
+            by_origin[origin] = by_origin.get(origin, 0) + 1
+            ev = float(evalue)
+            for band in EXPORT_EVALUE_BANDS:
+                if ev <= band:
+                    by_evalue[band] += 1
+            out.write("\t".join((str(total), sseqid, origin, pident, length, qstart,
+                                 qend, sstart, send, slen, evalue, bitscore)) + "\n")
+    return total, {"by_evalue": {f"{b:g}": n for b, n in by_evalue.items()},
+                   "by_origin": by_origin}
+
+
+def export_header(event, total):
+    """Commented header for the export TSV: provenance, then the column row."""
+    lines = [
+        "PETadex sequence search export (all significant hits)",
+        f"export_format: {EXPORT_FORMAT_VERSION}",
+        f"query: {event.get('queryHeader') or 'query'} ({len(event['querySequence'])} aa)",
+        f"database_release: {event.get('databaseRelease')}  "
+        f"database_version: {event.get('version')}",
+        f"search_version: {event.get('searchVersion')}  engine: diamond  "
+        f"evalue_cutoff: 1e-3  dbsize: {event.get('dbSize')}",
+        f"total_hits: {total}  generated: {datetime.now(timezone.utc).isoformat()}",
+        "ranked like the search: bitscore desc, then evalue asc",
+    ]
+    return "".join(f"# {l}\n" for l in lines) + "\t".join(EXPORT_COLUMNS) + "\n"
+
+
+def handle_export(event):
+    """Export mode (maxResults == EXPORT_DEPTH): merge the 32 uncapped parts.
+
+    Writes, under the export's own sessionId (common.export_session_id):
+      results/{sessionId}/{jobId}/hits.tsv.gz   every hit, ranked, header first
+      results/{sessionId}/{jobId}.json          summary: counts + the file key
+      results/{sessionId}.index                 → jobId, like a search
+    The header is its own gzip member in front of the data member (a valid
+    multi-member gzip, read transparently by gzip/zcat/pandas/R), so the rows
+    stream to disk once without knowing the total in advance. All three objects
+    are tagged reapable: an export is a 14-day cache, rebuilt on demand after.
+    """
+    session_id = event["sessionId"]
+    job_id = event["jobId"]
+    expected_parts = len(event["shards"]) if "shards" in event else None
+    phase_ms = {}
+
+    t0 = time.monotonic()
+    bodies = read_export_parts(session_id, job_id)
+    phase_ms["read_parts_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    if expected_parts is not None and len(bodies) != expected_parts:
+        raise RuntimeError(f"expected {expected_parts} export parts, found {len(bodies)}")
+
+    t0 = time.monotonic()
+    data_path, out_path = "/tmp/export_rows.tsv.gz", "/tmp/export_hits.tsv.gz"
+    total, counts = merge_export(bodies, data_path)
+    del bodies
+    with open(out_path, "wb") as out:
+        out.write(gzip.compress(export_header(event, total).encode()))
+        with open(data_path, "rb") as data:
+            shutil.copyfileobj(data, out, 16 * 1024 * 1024)
+    os.remove(data_path)
+    phase_ms["merge_ms"] = round((time.monotonic() - t0) * 1000, 1)
+
+    t0 = time.monotonic()
+    hits_key = f"results/{session_id}/{job_id}/hits.tsv.gz"
+    hits_bytes = os.path.getsize(out_path)
+    with open(out_path, "rb") as f:
+        s3.put_object(Bucket=S3_BUCKET, Key=hits_key, Body=f,
+                      ContentType="application/gzip",
+                      ContentDisposition='attachment; filename="petadex_hits.tsv.gz"',
+                      Tagging="reapable=true")
+    os.remove(out_path)
+    summary = {
+        "kind": "export",
+        "status": "complete",
+        "export_format": EXPORT_FORMAT_VERSION,
+        "query_header": event.get("queryHeader"),
+        "query_length": len(event["querySequence"]),
+        "database": event.get("corpus"),
+        "database_release": event.get("databaseRelease"),
+        "database_version": event.get("version"),
+        "search_version": event.get("searchVersion"),
+        "evalue_cutoff": 1e-3,
+        "total_hits": total,
+        **counts,
+        "files": {"hits_tsv_gz": {"key": hits_key, "bytes": hits_bytes,
+                                  "columns": EXPORT_COLUMNS}},
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result_key = f"results/{session_id}/{job_id}.json"
+    s3.put_object(Bucket=S3_BUCKET, Key=result_key, Body=json.dumps(summary),
+                  ContentType="application/json", Tagging="reapable=true")
+    s3.put_object(Bucket=S3_BUCKET, Key=f"results/{session_id}.index",
+                  Body=job_id, ContentType="text/plain", Tagging="reapable=true")
+    phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    phase_ms["total_ms"] = round(sum(phase_ms.values()), 1)
+    print(f"export: {total} hits, {hits_bytes} bytes -> s3://{S3_BUCKET}/{hits_key} "
+          f"({phase_ms})")
+
+    write_job_timing(session_id, job_id, event.get("version"),
+                     expected_parts or 0, event.get("submittedAt"),
+                     status="success", aggregator_timing=phase_ms,
+                     orchestrator_timing=event.get("orchestratorTiming"))
+    return {"sessionId": session_id, "jobId": job_id, "s3_key": result_key,
+            "num_results": total}
 
 
 def read_shard_metas(session_id, job_id):
@@ -267,6 +422,9 @@ def handler(event, context):
                          event.get("submittedAt"), status="failed",
                          orchestrator_timing=event.get("orchestratorTiming"))
         return {"sessionId": session_id, "jobId": job_id, "status": "failed"}
+
+    if int(event.get("maxResults", 50)) == EXPORT_DEPTH:
+        return handle_export(event)
 
     query_header = event.get("queryHeader")
     query_sequence = event["querySequence"]

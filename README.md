@@ -316,9 +316,22 @@ The `version` action reports the depth a *fresh* search would use, so the app ca
 
 > **Changing `RESULT_DEPTH` does not require a `SEARCH_VERSION` bump.** Because each result carries its own `result_depth`, raising the constant re-runs only those queries whose stored depth is too shallow, instead of busting the whole cache. (The 1.3.0 → 1.4.0 bump was needed for the one-time *switch* to fixed-depth searching, not for future depth changes.)
 >
-> **Never set it to 0 / unlimited.** Against a 307M-sequence corpus a promiscuous query would produce an unbounded payload — and since 1.3.0 every hit carries a full protein sequence (~586 B/hit, so ~293 KB at depth 500).
+> **Never set it to 0 / unlimited.** Against a 307M-sequence corpus a promiscuous query would produce an unbounded payload — and since 1.3.0 every hit carries a full protein sequence (~586 B/hit, so ~293 KB at depth 500). Uncapped results exist only as the on-demand, sequence-free [export](#export-of-all-significant-hits).
 
 **The display-side subsetting lives in `petadex.io`, not here** — this repo's job is to search deep, store the depth, and report it. ⚠️ In the Express app the slice must happen **before** `enrichWithFamilyData()`, otherwise that per-request Postgres round trip runs over the full stored depth instead of the displayed count.
+
+### Export of all significant hits
+
+The search stops at `RESULT_DEPTH` per shard, so DIAMOND never computes the rest. Measured on one v260701 shard and scaled to the corpus, a query has ~31k (SRR10663367) to ~7.9M (a C003 query) hits at e ≤ 1e-3, so "all hits" can't be part of every search. The `export` action re-runs the fan-out with no cap, on demand:
+
+- **No state-machine change.** It rides `maxResults = 0` (`common.EXPORT_DEPTH`, DIAMOND's `-k 0` = no limit) through the existing Map; the orchestrator is the only producer of 0.
+- **Own sessionId** (`common.export_session_id`: `{sessionId}_x`), so a failed export writes its own `.error` and can't fail the search. The suffix is two characters because public execution names must fit in 80.
+- **Worker:** `-k 0`, columns `common.EXPORT_OUTFMT` (no sequences, plus `slen`), rows sorted by `common.export_rank_key` (the search's ranking: bitscore desc, e-value asc, then id), written as `parts/shard_N.tsv.gz`.
+- **Aggregator:** k-way merge of the 32 sorted parts into `results/{sessionId}_x/{jobId}/hits.tsv.gz`, plus the summary `results/{sessionId}_x/{jobId}.json` and `.index`. All are tagged `reapable=true`, so an export is a 14-day cache that is rebuilt on demand.
+
+`hits.tsv.gz` (format `common.EXPORT_FORMAT_VERSION`, 1.0): commented `#` provenance lines (query, `database_release`/`database_version`, `search_version`, e-value cutoff, `dbsize`, `total_hits`, time), then a column row `rank target_id origin pident aln_len qstart qend sstart send slen evalue bitscore`, then one row per hit. The header is its own gzip member in front of the data member; `gzip`/`zcat`/pandas/R read that as one file. The summary JSON carries `total_hits`, `by_evalue` (hits at or below 1e-3/1e-10/1e-30/1e-50), `by_origin` (plasticome/ncbi_nr/logan from the `petadex_id` prefix) and the file key.
+
+**Cost.** Per shard, an uncapped search took 1.2–2.2× the capped one (watson, 6 threads). The aggregator merge of the largest family measured 7.9M rows in ~50–100 s on one watson core, so the aggregator needs more than its 1,024 MB / 120 s for exports (planned: 2,048 MB, 600 s). Tests: `tests/test_export.py`.
 
 ### Cleanup & lifecycle
 
@@ -416,7 +429,7 @@ petadex-sequence-search/
 
 ## Lambda API
 
-The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which accepts three actions via the event body. The contract is unchanged from the legacy path, so callers needed only a function-name swap.
+The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which accepts four actions via the event body. The contract is unchanged from the legacy path, so callers needed only a function-name swap.
 
 **Search** — validates the query, starts the Step Functions execution, and returns immediately (the aggregator publishes the result minutes later; the caller polls `results/{sessionId}.index`):
 ```json
@@ -437,6 +450,36 @@ Response:
   "s3_key": "results/abc123/550e8400-e29b-41d4-a716-446655440000.json"
 }
 ```
+
+**Export** — every significant hit for a query (e ≤ 1e-3, no hit cap), on demand. Same request as a search, with the search's `sessionId` (cache key). If a finished export exists it comes back as `ready`; otherwise the uncapped fan-out starts and the response is `running`, with the same admission limits and in-flight dedup as a search:
+```json
+{
+  "action": "export",
+  "sessionId": "abc123",
+  "sequence": "MKLLIVLLAACLAVFAAAEPQIAVV"
+}
+```
+
+Response (`running`; poll `s3_key` like a search, or `results/{export_session_id}.error` on failure):
+```json
+{
+  "status": "running",
+  "job_id": "…",
+  "s3_key": "results/abc123_x/….json",
+  "export_session_id": "abc123_x"
+}
+```
+Response (`ready`; the caller reads the summary and presigns `hits_key`; the orchestrator can list but not read results):
+```json
+{
+  "status": "ready",
+  "job_id": "…",
+  "s3_key": "results/abc123_x/….json",
+  "hits_key": "results/abc123_x/…/hits.tsv.gz",
+  "export_session_id": "abc123_x"
+}
+```
+See [Export of all significant hits](#export-of-all-significant-hits) for the files.
 
 **History:**
 ```json
