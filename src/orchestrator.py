@@ -299,9 +299,10 @@ def find_export(export_sid):
     """Return the response for a finished export under `export_sid`, or None.
 
     A finished export is a `results/{export_sid}/{jobId}.json` summary whose
-    `hits.tsv.gz` AND `hits.fasta.gz` still exist (all expire after 14 days,
-    see aggregator handle_export; a format-1.0 export has no FASTA, so it is
-    rebuilt). Listing only: the orchestrator role can list the bucket but not
+    `hits.tsv.gz` AND `hits.fasta.gz` both exist. Exports are kept like search
+    results (see aggregator handle_export); the check still matters because a
+    format-1.0 export has no FASTA and is rebuilt, and exports made before
+    2026-10-27 were tagged to expire. Listing only: the orchestrator role can list the bucket but not
     read results, so the caller (the petadex.io backend) reads the summary and
     presigns the downloads.
     """

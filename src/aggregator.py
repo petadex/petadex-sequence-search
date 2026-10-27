@@ -238,8 +238,9 @@ def handle_export(event):
       results/{sessionId}.index                   → jobId, like a search
     The total comes from the worker sidecars up front, so both headers go first
     and each file streams to disk once. The FASTA carries no comment lines (not
-    valid FASTA); its provenance is in the TSV header and the summary. All
-    objects are tagged reapable: an export is a 14-day cache, rebuilt on demand.
+    valid FASTA); its provenance is in the TSV header and the summary. These
+    are kept like a search result (untagged, decided 2026-10-27); only the
+    parts/ are tagged reapable and expire after 14 days.
     """
     session_id = event["sessionId"]
     job_id = event["jobId"]
@@ -277,8 +278,7 @@ def handle_export(event):
         files[name] = {"key": key, "bytes": os.path.getsize(path)}
         s3.upload_file(path, S3_BUCKET, key, Config=EXPORT_UPLOAD, ExtraArgs={
             "ContentType": "application/gzip",
-            "ContentDisposition": f'attachment; filename="{filename}"',
-            "Tagging": "reapable=true"})
+            "ContentDisposition": f'attachment; filename="{filename}"'})
         os.remove(path)
     files["hits_tsv_gz"]["columns"] = EXPORT_COLUMNS
     summary = {
@@ -299,9 +299,9 @@ def handle_export(event):
     }
     result_key = f"results/{session_id}/{job_id}.json"
     s3.put_object(Bucket=S3_BUCKET, Key=result_key, Body=json.dumps(summary),
-                  ContentType="application/json", Tagging="reapable=true")
+                  ContentType="application/json")
     s3.put_object(Bucket=S3_BUCKET, Key=f"results/{session_id}.index",
-                  Body=job_id, ContentType="text/plain", Tagging="reapable=true")
+                  Body=job_id, ContentType="text/plain")
     phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
     phase_ms["total_ms"] = round(sum(phase_ms.values()), 1)
     print(f"export: {total} hits, files {files} ({phase_ms})")

@@ -266,11 +266,11 @@ check("summary points at both files",
       and summary["files"]["hits_fasta_gz"]["key"] == f"results/{SID}_x/J/hits.fasta.gz"
       and summary["files"]["hits_fasta_gz"]["bytes"] == len(fasta["Body"]))
 check("summary is an export, format 1.1", summary["kind"] == "export" and summary["export_format"] == "1.1")
-check("both files uploaded tagged reapable, as attachments",
-      all(u["ExtraArgs"]["Tagging"] == "reapable=true" and "attachment" in u["ExtraArgs"]["ContentDisposition"]
+check("both files uploaded as attachments, NOT tagged reapable (kept like a search)",
+      all("Tagging" not in u["ExtraArgs"] and "attachment" in u["ExtraArgs"]["ContentDisposition"]
           for u in (hits, fasta)))
-check("summary + index tagged reapable",
-      all(written[k].get("Tagging") == "reapable=true" for k in (f"results/{SID}_x/J.json", f"results/{SID}_x.index")))
+check("summary + index NOT tagged reapable (kept like a search)",
+      all("Tagging" not in written[k] for k in (f"results/{SID}_x/J.json", f"results/{SID}_x.index")))
 check("handler returns total", ret.get("num_results") == len(rows_all))
 check("timing.json written", f"results/{SID}_x/J/timing.json" in written)
 check("local files cleaned up", not any(os.scandir(aggregator.EXPORT_DIR)))
