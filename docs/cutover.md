@@ -1,4 +1,73 @@
-# Lambda zstd Cutover — release-day runbook
+# Search cutovers
+
+Two database cutovers of the sharded DIAMOND search, newest first. A cutover is
+a write to `s3://petadex/diamond/LATEST`: the orchestrator reads it once per job
+and pins every worker, so no code deploy is needed and rollback is the same
+one-line write.
+
+## v260701 — 2026-10-27 (DONE)
+
+`LATEST`: `catalytic_orfs_v1.1_20260610_173654` → `petadex_seq_v260701_20261026_202443`.
+
+**What changed for users.** Every unpinned search now runs against the v260701
+release: 298,687,346 full-length catalytic proteins (PAZy 486, NCBI nr 6,764,617,
+Logan 291,922,243), 88,181,580,142 residues, 32 zstd-19 `.fa.zst` shards. Hit IDs
+are `petadex_id`s (`PL…` / `NR…` / `LG…`) instead of v1.1's `orf||run|…`; the
+petadex.io backend and Gatsby site parse both, per hit. `metadata` is `null`
+until tier-A enrichment exists (v260701 is not in RDS yet). The engine and
+settings are unchanged: DIAMOND 2.2.2, `default` sensitivity, `-b1` with the
+cross-block merge, `--dbsize` = `total_letters`, top 500.
+
+**Order of events.**
+1. Built and uploaded with `scripts/db/run_v260701_rebuild.sh` (verify corpus →
+   `build_diamond_shards.py --format zstd --shard-count 32 --no-bump-latest` →
+   manifest checks → `scripts/deploy/validate_pinned_version.py`), 2026-10-26.
+2. Validated pinned: the site examples with a per-hit cross-version leak check,
+   a 10-family recall check, a failure-path regression (a pinned search against a
+   `diamond/smoketest-failpath-*` manifest with missing shards: `.error` written
+   in 5 s, backend reported `failed` in 3 s).
+3. Fixed before the flip: the worker's `/tmp` shard cache was keyed by file name,
+   so warm Lambdas served the wrong version's shard when two versions were live
+   (`a6f6633`, `tests/test_shard_cache.py`).
+4. Site examples pinned to v260701 via `data/examples-version` (`6dd5aa8`), then
+   **the user wrote `LATEST`** (Claude Code's safety check blocks that write for
+   the assistant). Done ahead of the planned `web/` pages, at the user's request.
+5. Verified: the orchestrator `version` action reports v260701; an unpinned
+   SRR10663367 search returned 500/500 `petadex_id`s, top hit `LG113721682`
+   at 100 % (v1.1 had no 100 % hit).
+6. `data/examples-version` removed (`5728a45`); the deploy regenerated the
+   examples against `LATEST` (all three on v260701).
+
+**Rollback.**
+```
+printf '%s' catalytic_orfs_v1.1_20260610_173654 > /tmp/LATEST && \
+AWS_PROFILE=default aws s3api put-object --bucket petadex --key diamond/LATEST \
+  --body /tmp/LATEST --content-type text/plain --server-side-encryption AES256
+```
+The v1.1 shards are still at `s3://petadex/diamond/catalytic_orfs_v1.1_20260610_173654/`;
+don't reap them while a rollback might be needed. Cached results are keyed by
+`database_version`, so neither direction serves the other version's cache. After
+a rollback the example pages regenerate on the next deploy (or pin them with
+`data/examples-version`).
+
+**Left open at the flip.** PL559 (AII11221.1) is absent from v260701 because of
+the 2026-10-18 core-selection rule; if that rule changes, rebuild with
+`run_v260701_rebuild.sh` and flip again. The `web/` search pages and tier-A
+metadata enrichment come later. Details: the Obsidian vault notes
+*v260701 Search Corpus Build* and *Search Lambda - TODO*.
+
+---
+
+## v1.1 zstd cutover — 2026-06-26 (DONE, historical runbook)
+
+The runbook below was written before the zstd cutover and is kept as the record
+of how it was planned. It happened 2026-06-26 on the DIAMOND **2.2.2** release
+(see the vault note *09 - v2.2.2 Release Cutover*); `LATEST` then pointed at
+`catalytic_orfs_v1.1_20260610_173654` until the v260701 flip above. The
+"UNCOMMITTED" and "waiting on a tagged release" statements below describe that
+time, not the current state.
+
+### Lambda zstd Cutover — release-day runbook (as written before 2026-06-26)
 
 **Status:** waiting on a **tagged DIAMOND release** carrying the compressed-FASTA
 cross-block-merge fix. Everything below is validated and staged; the cutover is
@@ -19,7 +88,7 @@ real Lambda, 5 cold runs each:
 Correct (all 10 runs: 50 hits, identical `hitset_sig` across both arms; across-shard
 merge cross-validated). Verdict **(A) cutover-ready**.
 
-## Winning config to pin
+### Winning config to pin
 
 - **DB:** 32-shard `.fa.zst`, zstd level 19, round-robin partition.
 - **Binary:** DIAMOND with the cross-block-merge fix (validated at `dev@4b2ae056`),
@@ -29,7 +98,7 @@ merge cross-validated). Verdict **(A) cutover-ready**.
 - **`--dbsize`:** whole-corpus letters from the manifest (`total_letters`).
 - **Lambda:** 10240 MB / 600 s / arm64 (unchanged from today).
 
-## Pre-staged changes (already in the working tree, UNCOMMITTED)
+### Pre-staged changes (already in the working tree, UNCOMMITTED)
 
 1. **`Dockerfile`** — added `ARG DIAMOND_BUILD_TOOLCHAIN=base` (default = today's
    build byte-for-byte). The DIAMOND build is now an `if`: `base` is unchanged;
@@ -42,7 +111,7 @@ merge cross-validated). Verdict **(A) cutover-ready**.
    `DIAMOND_FASTA_BLOCK_OVERRIDE` benchmark hack). **Default unset → prod behavior
    unchanged** (`-b4` single-block sizing, safe for the stock 2.2.1 binary).
 
-## Cutover steps (when the release tag is published)
+### Cutover steps (when the release tag is published)
 
 1. **Build-test the release binary** on the arm64 box:
    ```
@@ -69,7 +138,7 @@ merge cross-validated). Verdict **(A) cutover-ready**.
 6. **Flip `LATEST`** to the new 32-shard zstd version prefix. Orchestrator reads it
    once per job and pins every worker.
 
-## Verifications / open items at cutover
+### Verifications / open items at cutover
 
 - [ ] **Reserved concurrency** ≥ 32 + margin for the 32-wide fan-out (provision
   default is 160; today's prod is 20-shard). Couldn't read it from the dev box
@@ -84,14 +153,14 @@ merge cross-validated). Verdict **(A) cutover-ready**.
 - [ ] **Aggregator/orchestrator** need no change (format-agnostic), but redeploy on
   the same release image for consistency.
 
-## Rollback
+### Rollback
 
 `LATEST` still has the previous `.dmnd` version prefix — flip it back and unset
 `DIAMOND_FASTA_CROSSBLOCK_MERGE`. The orchestrator picks it up on the next job; no
 code redeploy required to revert the DB. (Reverting the binary = redeploy the prior
 image tag.)
 
-## References
+### References
 
 - `obsidian-vault/.../08 Compressed-FASTA Merge Dev Build Validation.md` — full
   validation (Gates 1–2, Stage 3 A/B, verdict).

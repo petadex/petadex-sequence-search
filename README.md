@@ -4,21 +4,21 @@
 
 <h1 align="center">PETadex Sequence Search</h1>
 
-<p align="center"><b>DIAMOND-powered protein search across 307M Logan catalytic ORFs</b></p>
+<p align="center"><b>DIAMOND-powered protein search across the 299M-sequence PETadex v260701 catalytic corpus</b></p>
 
 > **Note: This is an internal component, not a standalone tool. It is designed to be invoked as an AWS Lambda function by the PETadex web application.**
 
-**DIAMOND2-powered** protein sequence similarity search against the full Logan catalytic-ORF corpus (**307,155,746 sequences**). The database is split into 20 shards searched in parallel by fan-out worker Lambdas, coordinated by AWS Step Functions. Packaged as a Docker container that runs as AWS Lambda functions (orchestrator / worker / aggregator) or a standalone CLI.
+**DIAMOND2-powered** protein sequence similarity search against the PETadex **v260701** release: 298,687,346 full-length catalytic proteins (PAZy 486, NCBI nr 6,764,617, Logan 291,922,243). The database is split into 32 zstd-compressed FASTA shards searched in parallel by fan-out worker Lambdas, coordinated by AWS Step Functions. Packaged as a Docker container that runs as AWS Lambda functions (orchestrator / worker / aggregator) or a standalone CLI.
 
-The architecture is described in full below. A legacy single-Lambda MMseqs2 path also exists in this repo — see [Legacy MMseqs2 path](#legacy-mmseqs2-path) — but it no longer serves the web app (cutover to DIAMOND completed 2026-06-03; removal pending Phase 7).
+The default database became v260701 on 2026-10-27 (before that: the 307,155,746-sequence v1.1 Logan corpus); see [docs/cutover.md](docs/cutover.md). The legacy single-Lambda MMseqs2 path is retired — see [Legacy MMseqs2 path](#legacy-mmseqs2-path).
 
 ---
 
 ## Architecture — DIAMOND scale-out search
 
-The scale-out architecture replaces the single MMseqs2 Lambda with a **sharded, fan-out DIAMOND search** over the full Logan-scale protein corpus (**307,155,746 sequences**). The database is split into 20 shards, each searched in parallel by its own worker Lambda, with all shards resident on **S3** (not EFS). The web-app contract (event shape, result JSON, S3 keys) is preserved, so the cutover is a function-name swap on the caller's side.
+The scale-out architecture replaced the single MMseqs2 Lambda with a **sharded, fan-out DIAMOND search** over the full corpus (today **v260701, 298,687,346 sequences**). The database is split into 32 shards, each searched in parallel by its own worker Lambda, with all shards resident on **S3** (not EFS). The web-app contract (event shape, result JSON, S3 keys) is preserved, so the cutover is a function-name swap on the caller's side.
 
-> **Status:** live. The DIAMOND infra is deployed, the full 307M sharded DB is built and published (`diamond/LATEST`), and the web app was cut over to `petadex-diamond-orchestrator` (2026-06-03) — **users now search the Logan corpus, not nr.** The legacy MMseqs2 function remains deployed but no longer serves the web app (removal pending Phase 7).
+> **Status:** live. The web app was cut over from MMseqs2 to `petadex-diamond-orchestrator` on 2026-06-03, to 32 zstd shards on DIAMOND 2.2.2 on 2026-06-26, and to the v260701 database (`diamond/LATEST` = `petadex_seq_v260701_20261026_202443`) on 2026-10-27. The legacy MMseqs2 function was deleted 2026-10-27.
 
 ### Why these choices
 
@@ -37,8 +37,8 @@ The scale-out architecture replaces the single MMseqs2 Lambda with a **sharded, 
 |---|---|---|
 | **Orchestrator** | `petadex-diamond-orchestrator` | Validates + parses FASTA once, resolves the DB version, reads the shard manifest, mints `jobId`, returns `{job_id, s3_key}` immediately, and starts the Step Functions execution. Never block-waits. |
 | **State machine** | `petadex-diamond-search` (Step Functions) | A `Map` state fans out one worker per shard (`MaxConcurrency = SHARD_COUNT`). Per-branch retry on transient `Lambda.*` errors; `Catch: States.ALL` → fail-fast. Final state invokes the aggregator. |
-| **Worker** (×20 in parallel) | `petadex-diamond-worker` | Downloads its assigned shard `.dmnd` to `/tmp` (cached across warm invocations, evicting any other shard first), runs `diamond blastp`, writes a raw outfmt-6 TSV part to S3. One worker per shard. |
-| **Aggregator** | `petadex-diamond-aggregator` | Merges all parts → sorts by bitscore desc / evalue asc → top-K → enriches from RDS once → writes the final result JSON + `.index` pointer in the unchanged schema. |
+| **Worker** (×32 in parallel) | `petadex-diamond-worker` | Downloads its assigned `.fa.zst` shard to `/tmp` (cached per S3 key across warm invocations, evicting any other shard first), runs `diamond blastp`, writes a raw outfmt-6 TSV part to S3 (a sorted gzip part for an export). One worker per shard. |
+| **Aggregator** | `petadex-diamond-aggregator` | Merges all parts → sorts by bitscore desc / evalue asc → top-K → enriches from RDS once → writes the final result JSON + `.index` pointer in the unchanged schema. For an export, merges the uncapped parts into `hits.tsv.gz` + `hits.fasta.gz`. |
 
 All four share **one Docker image** (ARM64, DIAMOND built from source — no arm64 release binary exists); the Lambdas are distinguished by their `ImageConfig.Command` (`orchestrator.handler` / `worker.handler` / `aggregator.handler`). The `mmseqs` binary was removed from the image on 2026-06-26.
 
@@ -70,9 +70,9 @@ sequenceDiagram
     O-->>WA: { job_id, s3_key }  (immediate, ~1s)
     Note over WA,S3: web app starts polling results/{sid}.index
 
-    par fan-out — all 20 shards in parallel (~5 min)
+    par fan-out — all 32 shards in parallel (~45 s)
         SF->>W: invoke worker(shard N)
-        W->>S3: download shard_N.dmnd → /tmp
+        W->>S3: download shard_N.fa.zst → /tmp
         W->>W: diamond blastp (default sensitivity)
         W->>S3: write parts/shard_N.tsv + meta
     end
@@ -86,18 +86,20 @@ sequenceDiagram
 
 ### Sharded database on S3
 
-The corpus FASTA (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`) is streamed and split round-robin into 20 shards; each is built with `diamond makedb` into a `.dmnd` and uploaded. Built offline by `scripts/db/build_diamond_shards.py` (an arm64 box with ~300 GB scratch — not a laptop job).
+The corpus FASTA is split round-robin into 32 shards, each compressed with zstd level 19 into a `.fa.zst` that DIAMOND (built with zstd support) reads directly as its database, so no `diamond makedb` is needed and any Linux box can build it (v260701 was built on watson). Built by `scripts/db/build_diamond_shards.py --format zstd`; see `scripts/README.md`.
 
 ```
 s3://petadex/diamond/
 ├── LATEST                                    # text pointer → current version dir
-└── {version}/                                # e.g. catalytic_orfs_v1.1_20260602_222538
-    ├── manifest.json                         # version, corpus, shard_count, per-shard key/sequences/bytes
-    ├── shard_00.dmnd   (~5.6 GiB)            # 20 shards, ~15.36M sequences each
-    ├── shard_01.dmnd
+└── {version}/                                # e.g. petadex_seq_v260701_20261026_202443
+    ├── manifest.json                         # version, database_release, total_letters, per-shard key/sequences/letters/bytes
+    ├── shard_00.fa.zst  (~779 MB)            # 32 shards, ~9.33M sequences / ~2.756G residues each
+    ├── shard_01.fa.zst
     ├── ...
-    └── shard_19.dmnd
+    └── shard_31.fa.zst
 ```
+
+Earlier builds (`catalytic_orfs_v1.1_*`, 20 `.dmnd` shards until 2026-06-26, then 32 zstd shards) used `s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`.
 
 **Atomic versioning** (prevents mid-rebuild races): write all shards → write `manifest.json` → **then** update `LATEST`. The orchestrator reads `LATEST` once per job and passes the resolved version into the execution, so all workers pin to one version even if `LATEST` flips mid-job.
 
@@ -105,32 +107,29 @@ s3://petadex/diamond/
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Corpus size | 307,155,746 sequences | full Logan catalytic-ORF corpus |
-| Total `.dmnd` | ~112 GiB / 120 GB | 20 shards, ~5.6 GiB each |
-| `SHARD_COUNT` | **20** | bounded by `/tmp` (a shard must fit in 10 GB with headroom) |
+| Corpus size | 298,687,346 sequences / 88,181,580,142 residues | v260701 (v1.1 was 307,155,746 / 102,929,980,061) |
+| Total shard size | 24.34 GiB | 32 `.fa.zst` shards, ~779 MB each |
+| `SHARD_COUNT` | **32** | ~2.76 G residues per shard; peak worker RSS ~4.2 GB at `-b1` |
 | Worker memory | **10240 MB** (Lambda max, ≈6 vCPU) | DIAMOND search is CPU-bound; vCPU count sets search wall time |
-| Worker `/tmp` | **10240 MB** | holds one ~6 GB shard + query + output |
-| Worker timeout | **600 s** | ~78 s download + search ≈ ~290 s/shard at `--very-sensitive`, with headroom; default mode is faster, so the headroom only grows |
-| Worker reserved concurrency | **100** | 20 workers per search ⇒ caps at ~5 concurrent searches; must exceed peak burst (3 jobs × 20 = 60), not equal it |
+| Worker `/tmp` | **10240 MB** | holds one ~0.8 GB shard (cached per S3 key) + query + output; an uncapped export part is up to ~100 MB |
+| Worker timeout | **600 s** | a normal shard takes ~30–45 s; the slowest export shard measured 116 s |
+| Worker reserved concurrency | **200** | 32 workers per search; the orchestrator admits at most 4 running public searches (128 workers) |
+| Aggregator | **2048 MB / 600 s / 6144 MB `/tmp`** | sized for the export merge (7.9M rows + 1.4 GB FASTA in ~3 min); a normal aggregation takes ~3 s |
 | Sensitivity | **default** (no flag) | recall-for-speed trade chosen 2026-06-04 over the Phase-0 `--very-sensitive` lock (~34 s vs ~170 s per shard). Env `DIAMOND_SENSITIVITY` overrides (empty/`default`/`none` ⇒ no flag). Re-validate parity if distant homologs matter. |
 | `-b` (block size) | **1** | bounds RAM, not disk |
-| Per-shard timing | download ~78 s, search ~190 s, total ~290 s (measured at `--very-sensitive`) | job wall ~5 min; default mode reduces search time |
+| Per-shard timing | download ~8 s, search ~21–33 s (default sensitivity) | job wall ~43–58 s end to end (v260701, 2026-10-27) |
 
 ### Warm cache, cold starts & the download lever
 
-**The ~78 s shard download dominates the ~37 s search — it is the single biggest latency lever, and it is largely unavoidable at current query volume.** Each worker caches its `.dmnd` in `/tmp` and reuses it across warm invocations, but that cache only pays off when a warm container is handed the *same* shard again:
+**Since the zstd cutover (2026-06-26) the search, not the download, dominates:** a ~779 MB `.fa.zst` shard downloads in ~8 s and DIAMOND searches it in ~21–33 s (v260701, default sensitivity), so a job takes ~45 s end to end. (Before, a ~6 GB `.dmnd` took ~78 s to download at the Lambda per-function network ceiling of ~78 MB/s, and jobs took minutes.)
 
-- A `.dmnd` shard is ~6 GB and `/tmp` is 10 GB, so **only one shard fits at a time.** Before downloading, the worker evicts any other cached shard (otherwise a second 6 GB download overflows `/tmp` with `No space left on device`).
-- Lambda warm-container routing is **not shard-affine** (Hard Constraint #5) — there is no guarantee that the container holding shard *N* is the one invoked for shard *N* next time. A warm container handed a different shard evicts and re-downloads.
-- At low query volume, containers rarely stay warm between searches anyway, so **nearly every search is effectively cold**: ~20 parallel cold downloads of ~78 s each. The design assumes this ("plan for cold-dominated economics") — it is why S3 was chosen over EFS, and why end-to-end latency is ~5 min, not ~40 s.
+Each worker caches its shard in `/tmp` and reuses it across warm invocations:
 
-The ~78 s/shard download is the **Lambda per-function network ceiling** (~78 MB/s) at this object size, not a connection-pool or tuning issue (investigated — a pool fix changed nothing). So the download can't be meaningfully sped *per worker*; reducing it means changing the storage/caching model. The documented reopen levers, **only worth pulling if query volume rises** (otherwise the flat cost isn't justified):
+- **The cache file is named after the full S3 key** (`/tmp/shard_diamond_<version>_shard_NN.fa.zst`). Every version names its shards `shard_NN`, so a basename cache served one version's shard to a search pinned to another while two versions were live (found and fixed 2026-10-26, `a6f6633`, `tests/test_shard_cache.py`).
+- Before downloading, the worker evicts any other cached shard, so `/tmp` never holds two.
+- Lambda warm-container routing is **not shard-affine**, and at low query volume containers rarely stay warm between searches, so nearly every search is effectively cold. That's accepted by design; it's why S3 was chosen over EFS.
 
-- **EFS or a small persistent instance** — shards resident on a shared mount, no per-query download. ~$60/mo flat vs ~$2.80/mo for S3; this is the explicit S3-vs-EFS reopen condition.
-- **Provisioned/warm pool with shard affinity** — keep N warm containers, each pinned to a shard. Hard because Lambda doesn't expose affinity; would need careful routing.
-- **More, smaller shards** — smaller `.dmnd` per worker downloads faster in parallel, lowering wall time, at the cost of more invocations per search. The `/tmp` ceiling permits as few as ~15 shards but allows going higher.
-
-Until volume justifies one of these, the download cost is accepted by design. If it stops being acceptable, EFS is the first lever to pull.
+Levers if latency ever matters more: more, smaller shards (faster per-worker search, more invocations per job), EFS or a persistent instance (no per-query download, ~$60/mo flat), or a warm pool with shard affinity (hard: Lambda doesn't expose affinity). See the vault note *10 - Search-Time Optimization*.
 
 ### Result S3 layout & contract
 
@@ -203,7 +202,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `result_depth` | int | **Depth this job searched to** — the per-shard `-k` and the final truncation limit (`RESULT_DEPTH` in [common.py](src/common.py)). A cached result can serve any display count up to this; a deeper request must re-run. Added in `search_version` 1.4.0. See [Result depth](#result-depth--variable-display-count). |
 | `engine` | string | Search engine — always `diamond` on this path. |
 | `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
-| `database_release` | string \| null | **Human-facing corpus version**, e.g. `v1.1` (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
+| `database_release` | string \| null | **Human-facing corpus version**, e.g. `v260701` (earlier `v1.1`) (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
 | `database_version` | string | **Precise build tag** of the corpus (e.g. `catalytic_orfs_v1.1_20260602_222538`). Pins the result to one exact build of a release — changes on *every* rebuild, even within the same `database_release`. This is the corpus identifier the cache key should use. |
 | `search_version` | string | **Search-pipeline version** (semver, e.g. `1.0.0`) — independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
 | `db_sequence_count` | int | **Sequence** count across all shards (307,155,746). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is a **residue** count (~105B residues ≈ 341.65 × 307,155,746 sequences; see Scoring & e-values). |
@@ -279,12 +278,12 @@ A side-car rollup written **beside** the result (not inside it), so it survives 
 
 | Field | Type | Description |
 |---|---|---|
-| `shard_index` | int | Shard identifier (0–19). |
-| `download_ms` | float | Time to download the shard `.dmnd` to `/tmp`. |
+| `shard_index` | int | Shard identifier (0–31). |
+| `download_ms` | float | Time to download the shard to `/tmp` (~8 s for a ~779 MB `.fa.zst`; 0 on a warm cache hit). |
 | `search_ms` | float | Time for `diamond blastp` on this shard. |
 | `total_ms` | float | Download + search for this shard. |
-| `shard_size_bytes` | int | Size of the shard `.dmnd` (~6.0 GB / ~5.6 GiB each). |
-| `shard_seq_count` | int | Sequences in this shard (~15.36M each). |
+| `shard_size_bytes` | int | Size of the shard file (~779 MB per v260701 `.fa.zst`). |
+| `shard_seq_count` | int | Sequences in this shard (~9.33M each in v260701). |
 | `num_hits` | int | Hits this shard contributed before the global merge. |
 | `status` | string | Per-shard status (`success` / `failed` / `missing`). |
 | `error` | string \| null | Error message if the shard failed; `null` on success. |
@@ -292,7 +291,7 @@ A side-car rollup written **beside** the result (not inside it), so it survives 
 
 A shard whose worker died before writing its sidecar appears as `{ "shard_index": i, "status": "missing" }` rather than being dropped.
 
-**Notes from observed data.** Shards are near-perfectly even — every shard holds 15,357,787–15,357,788 sequences and ~6.017 GB, confirming the round-robin partition balances both seq count and residues (20 × ~15.357M = the 307,155,746 corpus total). Per-shard `download_ms` is uniform (~77–78 s, the Lambda network ceiling), so the `fastest_slowest_spread_ms` comes entirely from `search_ms`, which clusters into two bands (~29 s and ~37–38 s). The bimodality is not explained by sequence count (identical across shards) and is attributed to **Lambda vCPU allocation variance** (cold-vs-warm CPU) — a known, benign source of the ~9–10 s spread.
+**Notes from observed data (v1.1, 20 `.dmnd` shards, before 2026-06-26).** Shards are near-perfectly even — every shard holds 15,357,787–15,357,788 sequences and ~6.017 GB, confirming the round-robin partition balances both seq count and residues (20 × ~15.357M = the 307,155,746 corpus total). Per-shard `download_ms` is uniform (~77–78 s, the Lambda network ceiling), so the `fastest_slowest_spread_ms` comes entirely from `search_ms`, which clusters into two bands (~29 s and ~37–38 s). The bimodality is not explained by sequence count (identical across shards) and is attributed to **Lambda vCPU allocation variance** (cold-vs-warm CPU) — a known, benign source of the ~9–10 s spread. *(v260701: 32 shards of 9,333,979–9,333,980 sequences and ~2.756 G residues each; download ~8 s.)*
 
 ### Result depth & variable display count
 
@@ -584,16 +583,19 @@ docker run --rm -v $PWD:/work --entrypoint python3 \
 
 ## Database Updates
 
-The sharded DIAMOND database is version-controlled via a `LATEST` pointer in `s3://petadex/diamond/`. Rebuilds run **offline on an arm64 box** with ~300 GB scratch (not a laptop) — `build_diamond_shards.py` streams the corpus FASTA from S3, splits it round-robin into 20 shards, builds each with `diamond makedb`, uploads them, writes `manifest.json`, then bumps `LATEST` (atomic ordering — see [Sharded database on S3](#sharded-database-on-s3)):
+The sharded DIAMOND database is version-controlled via a `LATEST` pointer in `s3://petadex/diamond/`. `build_diamond_shards.py --format zstd` splits a corpus FASTA round-robin into 32 shards, compresses each to `.fa.zst`, uploads them, writes `manifest.json`, then (unless `--no-bump-latest`) bumps `LATEST` (atomic ordering — see [Sharded database on S3](#sharded-database-on-s3)). zstd shards need no `makedb`, so any Linux box with enough scratch works. For a new release use `--no-bump-latest`, validate pinned (`scripts/deploy/validate_pinned_version.py`), then flip `LATEST` as in [docs/cutover.md](docs/cutover.md). The v260701 build ran end to end via `scripts/db/run_v260701_rebuild.sh`:
 
 ```bash
-# On an arm64 host with diamond on PATH and ~300 GB scratch:
-python3 scripts/db/build_diamond_shards.py --scratch-dir /mnt/scratch
+python3 scripts/db/build_diamond_shards.py --format zstd --shard-count 32 \
+  --local-corpus PETadex.seq.v260701.fa --key diamond/corpus/PETadex.seq.v260701.fa \
+  --expected-count 298687346 --expected-letters 88181580142 \
+  --release v260701 --version-prefix petadex_seq_v260701 \
+  --scratch-dir /scratch --threads 64 --no-bump-latest
 ```
 
 No Lambda redeployment is needed — each worker resolves `LATEST` per job and pins the version, so the next job picks up a new build automatically. The runbook (instance type, scratch sizing, `total_letters` backfill for e-value `--dbsize`) is in `scripts/README.md`.
 
-> **Legacy:** the MMseqs2 index (`s3://petadex/mmseqs2/`) is retained during the transition but no longer serves the web app. Its builder script was removed 2026-10-26 (in git history). See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
+> **Legacy:** the MMseqs2 index (`s3://petadex/mmseqs2/`, 14 objects, 3.7 GB) is still in the bucket but serves nothing; its builder and handler were removed 2026-10-26/27 (in git history). See [Legacy MMseqs2 path](#legacy-mmseqs2-path).
 
 ---
 
@@ -610,7 +612,7 @@ No Lambda redeployment is needed — each worker resolves `LATEST` per job and p
 - **Search**: DIAMOND2 `blastp` (scale-out, now serving the web app) · MMseqs2 `easy-search` (legacy single-Lambda, deployed but no longer serving; removal pending Phase 7)
 - **Runtime**: Python 3.11 on AWS Lambda ARM64 (Graviton)
 - **Coordination**: AWS Step Functions (`Map` fan-out) across orchestrator / worker / aggregator Lambdas
-- **Storage**: Amazon S3 (`petadex` bucket) — sharded `.dmnd` database + results
+- **Storage**: Amazon S3 (`petadex` bucket) — sharded `.fa.zst` database + results + exports
 - **Enrichment**: PETadex RDS (PostgreSQL) `blast_nr_metadata`
 - **CI/CD**: GitHub Actions → ECR → Lambda
-- **Database source**: full Logan catalytic-ORF corpus, 307M sequences (DIAMOND) · `enzyme_fastaa` ~1M nr subset (legacy MMseqs2)
+- **Database source**: PETadex v260701 full-length catalytic proteins, 298.7M sequences (since 2026-10-27; v1.1 Logan corpus, 307M, before)
