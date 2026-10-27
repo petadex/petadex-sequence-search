@@ -301,10 +301,11 @@ def find_export(export_sid):
     """Return the response for a finished export under `export_sid`, or None.
 
     A finished export is a `results/{export_sid}/{jobId}.json` summary whose
-    `hits.tsv.gz` still exists (both expire after 14 days, see aggregator
-    handle_export). Listing only: the orchestrator role can list the bucket but
-    not read results, so the caller (the petadex.io backend) reads the summary
-    and presigns the download.
+    `hits.tsv.gz` AND `hits.fasta.gz` still exist (all expire after 14 days,
+    see aggregator handle_export; a format-1.0 export has no FASTA, so it is
+    rebuilt). Listing only: the orchestrator role can list the bucket but not
+    read results, so the caller (the petadex.io backend) reads the summary and
+    presigns the downloads.
     """
     prefix = f"results/{export_sid}/"
     page = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/")
@@ -313,9 +314,13 @@ def find_export(export_sid):
     for obj in done:
         job_id = obj["Key"][len(prefix):-len(".json")]
         hits_key = f"{prefix}{job_id}/hits.tsv.gz"
-        if s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=hits_key).get("KeyCount"):
+        fasta_key = f"{prefix}{job_id}/hits.fasta.gz"
+        found = {o["Key"] for o in s3.list_objects_v2(
+            Bucket=S3_BUCKET, Prefix=f"{prefix}{job_id}/hits.").get("Contents", [])}
+        if {hits_key, fasta_key} <= found:
             return {"status": "ready", "job_id": job_id, "s3_key": obj["Key"],
-                    "hits_key": hits_key, "export_session_id": export_sid}
+                    "hits_key": hits_key, "fasta_key": fasta_key,
+                    "export_session_id": export_sid}
     return None
 
 

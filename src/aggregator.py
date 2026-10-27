@@ -31,7 +31,6 @@ per the plan. A real Logan-corpus metadata source is a separate, future concern.
 
 import gzip
 import heapq
-import io
 import json
 import os
 import shutil
@@ -39,6 +38,7 @@ import time
 from datetime import datetime, timezone
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 
 from common import (EXPORT_COLUMNS, EXPORT_DEPTH, EXPORT_EVALUE_BANDS,
                     EXPORT_FORMAT_VERSION, export_rank_key, hit_origin)
@@ -145,63 +145,77 @@ def read_parts(session_id, job_id):
     return results, n_parts
 
 
-def read_export_parts(session_id, job_id):
-    """Download every export part (`parts/shard_*.tsv.gz`) into memory.
+EXPORT_DIR = "/tmp/export"
+# Multipart upload for the export files (the FASTA of the largest family is
+# ~1.4 GB gzipped).
+EXPORT_UPLOAD = TransferConfig(multipart_chunksize=64 * 1024 * 1024, max_concurrency=8)
 
-    Parts are the worker's gzipped, rank-sorted rows (common.EXPORT_OUTFMT);
-    the largest measured family is ~4 MB per part compressed. Returns the list
-    of compressed bodies (one per shard) for `merge_export`.
+
+def download_export_parts(session_id, job_id):
+    """Download every export part (`parts/shard_*.tsv.gz`) to EXPORT_DIR.
+
+    Parts are the worker's gzipped, rank-sorted rows (common.EXPORT_OUTFMT, full
+    sequence last), up to ~55 MB each for the largest family, so they go to the
+    ephemeral disk rather than memory. Returns the local paths.
     """
+    shutil.rmtree(EXPORT_DIR, ignore_errors=True)  # warm container: no leftovers
+    os.makedirs(EXPORT_DIR)
     prefix = f"results/{session_id}/{job_id}/parts/"
-    paginator = s3.get_paginator("list_objects_v2")
-    bodies = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+    paths = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".tsv.gz"):
-                bodies.append(s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])["Body"].read())
-    return bodies
+                path = os.path.join(EXPORT_DIR, os.path.basename(obj["Key"]))
+                s3.download_file(S3_BUCKET, obj["Key"], path)
+                paths.append(path)
+    return paths
 
 
-def _export_rows(body):
-    """Yield the split rows of one gzipped export part."""
-    with gzip.open(io.BytesIO(body), "rt") as f:
+def _export_rows(path):
+    """Yield the split rows of one gzipped export part on disk."""
+    with gzip.open(path, "rt") as f:
         for line in f:
             if line.strip():
                 yield line.rstrip("\n").split("\t")
 
 
-def merge_export(bodies, out_path):
-    """Stream-merge rank-sorted export parts into one gzipped TSV of ranked rows.
+def merge_export(paths, tsv_out, fasta_out, total):
+    """Stream-merge rank-sorted export parts into the TSV and the FASTA.
 
     Each part is already sorted by common.export_rank_key, so a k-way heap merge
-    yields the global order without holding the hit set in memory. Writes the
-    data rows (EXPORT_COLUMNS) to `out_path`, header excluded — it needs the
-    total, which is only known at the end. Returns (total, counts) where counts
-    has `by_evalue` (hits at or below each band) and `by_origin`.
+    yields the global order without holding the hit set in memory. `tsv_out` and
+    `fasta_out` are open text streams that already carry their headers; each hit
+    becomes one TSV row (EXPORT_COLUMNS) and one FASTA record, in the same rank
+    order. `total` is the expected row count (from the worker sidecars) and is
+    checked. Returns counts: `by_evalue` (hits at or below each band) and
+    `by_origin`.
     """
     by_evalue = {band: 0 for band in EXPORT_EVALUE_BANDS}
     by_origin = {}
-    total = 0
-    merged = heapq.merge(*(_export_rows(b) for b in bodies), key=export_rank_key)
-    with gzip.open(out_path, "wt", compresslevel=6) as out:
-        for f in merged:
-            sseqid, qstart, qend, sstart, send, length, pident, evalue, bitscore, slen = f
-            total += 1
-            origin = hit_origin(sseqid)
-            by_origin[origin] = by_origin.get(origin, 0) + 1
-            ev = float(evalue)
-            for band in EXPORT_EVALUE_BANDS:
-                if ev <= band:
-                    by_evalue[band] += 1
-            out.write("\t".join((str(total), sseqid, origin, pident, length, qstart,
+    rank = 0
+    merged = heapq.merge(*(_export_rows(p) for p in paths), key=export_rank_key)
+    for f in merged:
+        sseqid, qstart, qend, sstart, send, length, pident, evalue, bitscore, slen, seq = f
+        rank += 1
+        origin = hit_origin(sseqid)
+        by_origin[origin] = by_origin.get(origin, 0) + 1
+        ev = float(evalue)
+        for band in EXPORT_EVALUE_BANDS:
+            if ev <= band:
+                by_evalue[band] += 1
+        tsv_out.write("\t".join((str(rank), sseqid, origin, pident, length, qstart,
                                  qend, sstart, send, slen, evalue, bitscore)) + "\n")
-    return total, {"by_evalue": {f"{b:g}": n for b, n in by_evalue.items()},
-                   "by_origin": by_origin}
+        fasta_out.write(f">{sseqid} rank={rank} evalue={evalue} bitscore={bitscore} "
+                        f"pident={pident} origin={origin}\n{seq}\n")
+    if rank != total:
+        raise RuntimeError(f"merged {rank} export rows, worker sidecars report {total}")
+    return {"by_evalue": {f"{b:g}": n for b, n in by_evalue.items()},
+            "by_origin": by_origin}
 
 
 def export_header(event, total):
-    """Commented header for the export TSV: provenance, then the column row."""
-    lines = [
+    """Provenance lines for the export files, without comment markers."""
+    return [
         "PETadex sequence search export (all significant hits)",
         f"export_format: {EXPORT_FORMAT_VERSION}",
         f"query: {event.get('queryHeader') or 'query'} ({len(event['querySequence'])} aa)",
@@ -212,20 +226,20 @@ def export_header(event, total):
         f"total_hits: {total}  generated: {datetime.now(timezone.utc).isoformat()}",
         "ranked like the search: bitscore desc, then evalue asc",
     ]
-    return "".join(f"# {l}\n" for l in lines) + "\t".join(EXPORT_COLUMNS) + "\n"
 
 
 def handle_export(event):
     """Export mode (maxResults == EXPORT_DEPTH): merge the 32 uncapped parts.
 
     Writes, under the export's own sessionId (common.export_session_id):
-      results/{sessionId}/{jobId}/hits.tsv.gz   every hit, ranked, header first
-      results/{sessionId}/{jobId}.json          summary: counts + the file key
-      results/{sessionId}.index                 → jobId, like a search
-    The header is its own gzip member in front of the data member (a valid
-    multi-member gzip, read transparently by gzip/zcat/pandas/R), so the rows
-    stream to disk once without knowing the total in advance. All three objects
-    are tagged reapable: an export is a 14-day cache, rebuilt on demand after.
+      results/{sessionId}/{jobId}/hits.tsv.gz     every hit, ranked, `#` header
+      results/{sessionId}/{jobId}/hits.fasta.gz   their full sequences, same order
+      results/{sessionId}/{jobId}.json            summary: counts + file keys
+      results/{sessionId}.index                   → jobId, like a search
+    The total comes from the worker sidecars up front, so both headers go first
+    and each file streams to disk once. The FASTA carries no comment lines (not
+    valid FASTA); its provenance is in the TSV header and the summary. All
+    objects are tagged reapable: an export is a 14-day cache, rebuilt on demand.
     """
     session_id = event["sessionId"]
     job_id = event["jobId"]
@@ -233,31 +247,40 @@ def handle_export(event):
     phase_ms = {}
 
     t0 = time.monotonic()
-    bodies = read_export_parts(session_id, job_id)
+    paths = download_export_parts(session_id, job_id)
+    metas = read_shard_metas(session_id, job_id)
     phase_ms["read_parts_ms"] = round((time.monotonic() - t0) * 1000, 1)
-    if expected_parts is not None and len(bodies) != expected_parts:
-        raise RuntimeError(f"expected {expected_parts} export parts, found {len(bodies)}")
+    if expected_parts is not None and len(paths) != expected_parts:
+        raise RuntimeError(f"expected {expected_parts} export parts, found {len(paths)}")
+    total = sum(int(m.get("num_hits") or 0) for m in metas.values())
 
     t0 = time.monotonic()
-    data_path, out_path = "/tmp/export_rows.tsv.gz", "/tmp/export_hits.tsv.gz"
-    total, counts = merge_export(bodies, data_path)
-    del bodies
-    with open(out_path, "wb") as out:
-        out.write(gzip.compress(export_header(event, total).encode()))
-        with open(data_path, "rb") as data:
-            shutil.copyfileobj(data, out, 16 * 1024 * 1024)
-    os.remove(data_path)
+    tsv_path = os.path.join(EXPORT_DIR, "hits.tsv.gz")
+    fasta_path = os.path.join(EXPORT_DIR, "hits.fasta.gz")
+    # FASTA at gzip level 1: real protein text compresses at ~41 MB/s (ratio
+    # 0.55) vs ~14 MB/s (0.52) at level 6, i.e. ~66 s vs ~197 s for the ~2.7 GB
+    # of sequence in the largest export, for a ~6% larger file. The TSV is small.
+    with gzip.open(tsv_path, "wt", compresslevel=6) as tsv_out, \
+            gzip.open(fasta_path, "wt", compresslevel=1) as fasta_out:
+        tsv_out.write("".join(f"# {l}\n" for l in export_header(event, total))
+                      + "\t".join(EXPORT_COLUMNS) + "\n")
+        counts = merge_export(paths, tsv_out, fasta_out, total)
+    for path in paths:
+        os.remove(path)
     phase_ms["merge_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
     t0 = time.monotonic()
-    hits_key = f"results/{session_id}/{job_id}/hits.tsv.gz"
-    hits_bytes = os.path.getsize(out_path)
-    with open(out_path, "rb") as f:
-        s3.put_object(Bucket=S3_BUCKET, Key=hits_key, Body=f,
-                      ContentType="application/gzip",
-                      ContentDisposition='attachment; filename="petadex_hits.tsv.gz"',
-                      Tagging="reapable=true")
-    os.remove(out_path)
+    files = {}
+    for name, path, filename in (("hits_tsv_gz", tsv_path, "petadex_hits.tsv.gz"),
+                                 ("hits_fasta_gz", fasta_path, "petadex_hits.fasta.gz")):
+        key = f"results/{session_id}/{job_id}/{os.path.basename(path)}"
+        files[name] = {"key": key, "bytes": os.path.getsize(path)}
+        s3.upload_file(path, S3_BUCKET, key, Config=EXPORT_UPLOAD, ExtraArgs={
+            "ContentType": "application/gzip",
+            "ContentDisposition": f'attachment; filename="{filename}"',
+            "Tagging": "reapable=true"})
+        os.remove(path)
+    files["hits_tsv_gz"]["columns"] = EXPORT_COLUMNS
     summary = {
         "kind": "export",
         "status": "complete",
@@ -271,8 +294,7 @@ def handle_export(event):
         "evalue_cutoff": 1e-3,
         "total_hits": total,
         **counts,
-        "files": {"hits_tsv_gz": {"key": hits_key, "bytes": hits_bytes,
-                                  "columns": EXPORT_COLUMNS}},
+        "files": files,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     result_key = f"results/{session_id}/{job_id}.json"
@@ -282,8 +304,7 @@ def handle_export(event):
                   Body=job_id, ContentType="text/plain", Tagging="reapable=true")
     phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
     phase_ms["total_ms"] = round(sum(phase_ms.values()), 1)
-    print(f"export: {total} hits, {hits_bytes} bytes -> s3://{S3_BUCKET}/{hits_key} "
-          f"({phase_ms})")
+    print(f"export: {total} hits, files {files} ({phase_ms})")
 
     write_job_timing(session_id, job_id, event.get("version"),
                      expected_parts or 0, event.get("submittedAt"),

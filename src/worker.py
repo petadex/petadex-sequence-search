@@ -331,7 +331,8 @@ def run_shard_search(query_fasta, db_local_path, max_results, dbsize=None,
         if n > 0:
             cmd += ["--dbsize", str(n)]
     # An export (max_results == EXPORT_DEPTH == 0, i.e. `-k 0`) can return
-    # hundreds of thousands of hits per shard, so it drops the sequence column.
+    # hundreds of thousands of hits per shard; it adds `slen` and keeps the
+    # full sequence last (~100 MB raw per shard for the largest family).
     outfmt = ["6", *EXPORT_OUTFMT] if max_results == EXPORT_DEPTH else OUTFMT
     cmd += ["--outfmt", *outfmt]
     print(f"$ {' '.join(cmd)}")
@@ -432,7 +433,7 @@ def handler(event, context):
         timings["num_hits"] = n_hits
         if max_results == EXPORT_DEPTH:
             # Export part: rows sorted by the aggregator's global rank key so it
-            # can stream-merge 32 parts; gzipped (~4x smaller, up to ~17 MB raw).
+            # can stream-merge 32 parts; gzipped (~2x, up to ~100 MB raw).
             part_key = f"results/{session_id}/{job_id}/parts/shard_{shard_index}.tsv.gz"
             body = gzip.compress(sort_export_rows(tsv).encode(), compresslevel=6)
             content_type = "application/gzip"

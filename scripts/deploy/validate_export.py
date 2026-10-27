@@ -10,6 +10,9 @@ same query, wait for both, and check the export file against the search:
     top N is at least as strong rank by rank (DIAMOND's -k is a heuristic, so
     the IDs need not be identical)
   - every hit is a v260701 petadex_id (no cross-version leak)
+  - hits.fasta.gz (streamed, never held in memory) has one record per TSV row
+    in the same order, each sequence as long as its `slen`, and the search's
+    own target sequences for the hits both returned
   - a second export call returns the cached copy as "ready"
 Time and cost come from each job's own timing.json: Lambda bills memory x
 duration, so cost = sum(worker total_ms) x worker GB + aggregator ms x
@@ -78,6 +81,32 @@ def wait(session, job, timeout=1200):
     raise TimeoutError(f"{session}/{job}")
 
 
+def check_fasta(key, data, search_hits):
+    """Stream the export FASTA from S3 and check it against the TSV rows."""
+    body = s3.get_object(Bucket=BUCKET, Key=key)["Body"]
+    want = {h["target_id"]: h["target_sequence"] for h in search_hits if h.get("target_sequence")}
+    n = ok_order = ok_len = ok_head = ok_seq = 0
+    header = None
+    with gzip.GzipFile(fileobj=body) as f:
+        for raw in f:
+            line = raw.decode().rstrip("\n")
+            if line.startswith(">"):
+                header = line
+                continue
+            if n < len(data):
+                d = data[n]
+                hid, *attrs = header[1:].split(" ")
+                ok_order += hid == d[1]
+                ok_len += len(line) == int(d[9])
+                ok_head += attrs[:3] == [f"rank={d[0]}", f"evalue={d[10]}", f"bitscore={d[11]}"]
+                ok_seq += hid not in want or want[hid] == line
+            n += 1
+    rows = len(data)
+    return {"fasta records == rows": n == rows, "fasta same order": ok_order == rows,
+            "fasta lengths == slen": ok_len == rows, "fasta headers": ok_head == rows,
+            "fasta seqs == search target_sequence": ok_seq == rows}, n
+
+
 def cost(session, job):
     """(total_wall_s, worker GB-s, aggregator GB-s, dollars) from timing.json.
     The aggregator writes timing.json just AFTER the result, so wait for it."""
@@ -132,13 +161,18 @@ def main():
             "search hits in export, same score": all(abs(exp.get(h["target_id"], -1) - h["bitscore"]) < 1e-6 for h in hits),
             "export top N >= search": all(float(d[11]) >= h["bitscore"] for d, h in zip(data, hits)),
             "all petadex_ids": all(PETADEX_ID.match(d[1]) for d in data),
-            "second call is cached": again.get("status") == "ready" and again.get("job_id") == r["job_id"],
+            "second call is cached": again.get("status") == "ready" and again.get("job_id") == r["job_id"]
+                                     and again.get("fasta_key") == summary["files"]["hits_fasta_gz"]["key"],
         }
+        fasta_checks, _ = check_fasta(summary["files"]["hits_fasta_gz"]["key"], data, hits)
+        checks.update(fasta_checks)
         recovered = len({d[1] for d in data[:len(hits)]} - {h["target_id"] for h in hits})
         slow = max(xt["shards"], key=lambda s: s.get("total_ms") or 0)
         row = {
             "query": name, "search_hits": len(hits), "export_hits": summary["total_hits"],
-            "file_mb": round(len(raw) / 1e6, 2), "recovered_top_n": recovered,
+            "file_mb": round(len(raw) / 1e6, 2),
+            "fasta_mb": round(summary["files"]["hits_fasta_gz"]["bytes"] / 1e6, 1),
+            "recovered_top_n": recovered,
             "search_wall_s": round(s_wall, 1), "search_usd": round(s_usd, 4),
             "export_e2e_s": round(x_e2e, 1), "export_wall_s": round(x_wall, 1),
             "export_slowest_shard_s": round((slow.get("total_ms") or 0) / 1000, 1),

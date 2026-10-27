@@ -98,20 +98,30 @@ prefix = f"results/{SID}_x/"
 done = {prefix: {"Contents": [
             {"Key": f"{prefix}old.json", "LastModified": datetime(2026, 10, 1, tzinfo=timezone.utc)},
             {"Key": f"{prefix}new.json", "LastModified": datetime(2026, 10, 27, tzinfo=timezone.utc)}]},
-        f"{prefix}new/hits.tsv.gz": {"KeyCount": 1},
-        f"{prefix}old/hits.tsv.gz": {"KeyCount": 1}}
+        f"{prefix}new/hits.": {"Contents": [{"Key": f"{prefix}new/hits.tsv.gz"},
+                                            {"Key": f"{prefix}new/hits.fasta.gz"}]},
+        f"{prefix}old/hits.": {"Contents": [{"Key": f"{prefix}old/hits.tsv.gz"},
+                                            {"Key": f"{prefix}old/hits.fasta.gz"}]}}
 orch, cap, sfn = load_orchestrator(done)
 body = json.loads(orch.handler({"action": "export", "sessionId": SID, "sequence": SEQ}, None)["body"])
 check("status ready", body.get("status") == "ready", str(body))
 check("newest export chosen", body.get("job_id") == "new", str(body))
-check("hits key returned", body.get("hits_key") == f"{prefix}new/hits.tsv.gz")
+check("hits + fasta keys returned", body.get("hits_key") == f"{prefix}new/hits.tsv.gz"
+      and body.get("fasta_key") == f"{prefix}new/hits.fasta.gz", str(body))
 check("no execution started", not sfn.start_execution.called)
 
-print("\n=== orchestrator: summary whose file expired -> re-export ===")
+print("\n=== orchestrator: format-1.0 export (no FASTA) -> re-export ===")
+v10 = {prefix: done[prefix], f"{prefix}new/hits.": {"Contents": [{"Key": f"{prefix}new/hits.tsv.gz"}]},
+       f"{prefix}old/hits.": {"Contents": [{"Key": f"{prefix}old/hits.tsv.gz"}]}}
+orch, cap, sfn = load_orchestrator(v10)
+body = json.loads(orch.handler({"action": "export", "sessionId": SID, "sequence": SEQ}, None)["body"])
+check("re-runs when hits.fasta.gz is missing", body.get("status") == "running" and sfn.start_execution.called, str(body))
+
+print("\n=== orchestrator: summary whose files expired -> re-export ===")
 expired = {prefix: done[prefix]}
 orch, cap, sfn = load_orchestrator(expired)
 body = json.loads(orch.handler({"action": "export", "sessionId": SID, "sequence": SEQ}, None)["body"])
-check("re-runs when hits.tsv.gz is gone", body.get("status") == "running" and sfn.start_execution.called, str(body))
+check("re-runs when the files are gone", body.get("status") == "running" and sfn.start_execution.called, str(body))
 
 print("\n=== orchestrator: search unchanged ===")
 orch, cap, sfn = load_orchestrator({})
@@ -129,10 +139,10 @@ seen = {}
 def fake_run(cmd, capture_output, text):
     seen["cmd"] = cmd
     out = cmd[cmd.index("-o") + 1]
-    rows = ["LG5\t1\t90\t1\t90\t90\t50.0\t1e-20\t100.0\t300",
-            "NR2\t1\t90\t1\t90\t90\t60.0\t1e-40\t180.0\t310",
-            "PL1\t1\t90\t1\t90\t90\t99.0\t1e-60\t250.0\t290",
-            "LG3\t1\t90\t1\t90\t90\t60.0\t1e-40\t180.0\t305"]
+    rows = ["LG5\t1\t90\t1\t90\t90\t50.0\t1e-20\t100.0\t300\tMKLG",
+            "NR2\t1\t90\t1\t90\t90\t60.0\t1e-40\t180.0\t310\tMKNR",
+            "PL1\t1\t90\t1\t90\t90\t99.0\t1e-60\t250.0\t290\tMKPL",
+            "LG3\t1\t90\t1\t90\t90\t60.0\t1e-40\t180.0\t305\tMKLL"]
     open(out, "w").write("\n".join(rows) + "\n")
     return types.SimpleNamespace(returncode=0, stderr="")
 
@@ -141,7 +151,7 @@ with mock.patch.object(worker.subprocess, "run", side_effect=fake_run):
     tsv = worker.run_shard_search(">q\nMKL\n", "/tmp/shard_x.fa.zst", 0, dbsize=88181580142)
 cmd = seen["cmd"]
 check("-k 0", cmd[cmd.index("-k") + 1] == "0")
-check("export columns, no full_sseq",
+check("export columns + slen, full_sseq last",
       cmd[cmd.index("--outfmt") + 1:] == ["6", *common.EXPORT_OUTFMT], str(cmd[cmd.index("--outfmt"):]))
 with mock.patch.object(worker.subprocess, "run", side_effect=fake_run):
     worker.run_shard_search(">q\nMKL\n", "/tmp/shard_x.fa.zst", 500, dbsize=88181580142)
@@ -158,7 +168,9 @@ check("export part is .tsv.gz, tagged reapable", part is not None and part["Tagg
 ids = [l.split("\t")[0] for l in gzip.decompress(part["Body"]).decode().splitlines()]
 check("part sorted bitscore desc, then evalue, then id", ids == ["PL1", "LG3", "NR2", "LG5"], str(ids))
 
-print("\n=== aggregator: merge 32 sorted parts into one ranked file ===")
+print("\n=== aggregator: merge 32 sorted parts into a ranked TSV + FASTA ===")
+import tempfile  # noqa: E402
+
 random.seed(7)
 n_shards, rows_all, part_bodies = 32, [], []
 for sh in range(n_shards):
@@ -167,70 +179,109 @@ for sh in range(n_shards):
         tid = random.choice(["LG", "NR", "PL"]) + str(sh * 1000 + i)
         bits = round(random.uniform(30, 600), 1)
         ev = f"{10 ** -random.uniform(3.1, 150):.2e}"
-        rows.append([tid, "1", "200", "5", "204", "200", "55.5", ev, str(bits), "321"])
+        seq = "M" + "".join(random.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(random.randint(50, 120)))
+        rows.append([tid, "1", "200", "5", "204", "200", "55.5", ev, str(bits), str(len(seq)), seq])
     rows_all.extend(rows)
     part_bodies.append(gzip.compress(common.sort_export_rows(
         "".join("\t".join(r) + "\n" for r in rows)).encode()))
 
-written = {}
+
+def run_export_aggregator(meta_hits):
+    """Run aggregator.handler in export mode; meta_hits[i] is shard i's num_hits."""
+    written, uploads = {}, {}
+
+    def put_object(**kw):
+        body = kw["Body"]
+        written[kw["Key"]] = dict(kw, Body=body.read() if hasattr(body, "read") else body)
+
+    def body_for(key):
+        i = int(key.split("shard_")[1].split(".")[0])
+        if key.endswith(".tsv.gz"):
+            return part_bodies[i]
+        return json.dumps({"shard_index": i, "num_hits": meta_hits[i]}).encode()
+
+    s3 = mock.MagicMock()
+    s3.get_paginator.return_value.paginate.side_effect = lambda **kw: [
+        {"Contents": [{"Key": f"{kw['Prefix']}shard_{i}.tsv.gz"} for i in range(n_shards)]
+         + [{"Key": f"{kw['Prefix']}shard_{i}.meta.json"} for i in range(n_shards)]}]
+    s3.get_object.side_effect = lambda Bucket, Key: {"Body": io.BytesIO(body_for(Key))}
+    s3.download_file.side_effect = lambda Bucket, Key, path: open(path, "wb").write(body_for(Key))
+    s3.upload_file.side_effect = lambda path, Bucket, Key, Config=None, ExtraArgs=None: uploads.update(
+        {Key: {"Body": open(path, "rb").read(), "ExtraArgs": ExtraArgs}})
+    s3.put_object.side_effect = put_object
+    with mock.patch("boto3.client", return_value=s3):
+        sys.modules.pop("aggregator", None)
+        import aggregator
+    aggregator.s3 = s3
+    aggregator.EXPORT_DIR = tempfile.mkdtemp() + "/export"
+    aggregator.fetch_metadata = lambda ids: (_ for _ in ()).throw(AssertionError("export must not hit RDS"))
+    ret = aggregator.handler({
+        "sessionId": SID + "_x", "jobId": "J", "querySequence": SEQ, "queryHeader": "q1",
+        "maxResults": 0, "shards": [{"shardIndex": i} for i in range(n_shards)],
+        "version": "V2", "databaseRelease": "v260701", "searchVersion": common.SEARCH_VERSION,
+        "corpus": MANIFEST["corpus"], "dbSize": 88181580142,
+    }, None)
+    return ret, written, uploads, aggregator
 
 
-def put_object(**kw):
-    body = kw["Body"]
-    written[kw["Key"]] = dict(kw, Body=body.read() if hasattr(body, "read") else body)
+per_shard = [gzip.decompress(b).count(b"\n") for b in part_bodies]
+ret, written, uploads, aggregator = run_export_aggregator(per_shard)
 
-
-s3 = mock.MagicMock()
-s3.get_paginator.return_value.paginate.side_effect = lambda **kw: [
-    {"Contents": [{"Key": f"{kw['Prefix']}shard_{i}.tsv.gz"} for i in range(n_shards)]
-     + [{"Key": f"{kw['Prefix']}shard_{i}.meta.json"} for i in range(n_shards)]}]
-s3.get_object.side_effect = lambda Bucket, Key: {"Body": io.BytesIO(
-    part_bodies[int(Key.split("shard_")[1].split(".")[0])] if Key.endswith(".tsv.gz")
-    else json.dumps({"shard_index": int(Key.split("shard_")[1].split(".")[0])}).encode())}
-s3.put_object.side_effect = put_object
-with mock.patch("boto3.client", return_value=s3):
-    sys.modules.pop("aggregator", None)
-    import aggregator
-aggregator.s3 = s3
-aggregator.fetch_metadata = lambda ids: (_ for _ in ()).throw(AssertionError("export must not hit RDS"))
-
-ret = aggregator.handler({
-    "sessionId": SID + "_x", "jobId": "J", "querySequence": SEQ, "queryHeader": "q1",
-    "maxResults": 0, "shards": [{"shardIndex": i} for i in range(n_shards)],
-    "version": "V2", "databaseRelease": "v260701", "searchVersion": common.SEARCH_VERSION,
-    "corpus": MANIFEST["corpus"], "dbSize": 88181580142,
-}, None)
-
-hits = written.get(f"results/{SID}_x/J/hits.tsv.gz")
+hits = uploads.get(f"results/{SID}_x/J/hits.tsv.gz")
+fasta = uploads.get(f"results/{SID}_x/J/hits.fasta.gz")
 summary = json.loads(written[f"results/{SID}_x/J.json"]["Body"])
-text = gzip.decompress(hits["Body"]).decode()  # multi-member: header + rows
-lines = text.splitlines()
+lines = gzip.decompress(hits["Body"]).decode().splitlines()
 header = [l for l in lines if l.startswith("#")]
 cols = lines[len(header)].split("\t")
 data = [l.split("\t") for l in lines[len(header) + 1:]]
 expected = sorted(rows_all, key=common.export_rank_key)
+fa = gzip.decompress(fasta["Body"]).decode().splitlines()
+fa_heads, fa_seqs = fa[0::2], fa[1::2]
 
 check("header first, carries total + versions",
       any(f"total_hits: {len(rows_all)}" in l for l in header)
-      and any("database_version: V2" in l for l in header), "\n".join(header))
+      and any("database_version: V2" in l for l in header)
+      and any("export_format: 1.1" in l for l in header), "\n".join(header))
 check("column row matches EXPORT_COLUMNS", cols == common.EXPORT_COLUMNS, str(cols))
 check("every hit present once", len(data) == len(rows_all) == summary["total_hits"],
       f"{len(data)} vs {len(rows_all)}")
 check("global order == full sort", [r[1] for r in data] == [r[0] for r in expected])
 check("ranks 1..N", [int(r[0]) for r in data] == list(range(1, len(data) + 1)))
 check("origin column", all(r[2] == common.hit_origin(r[1]) for r in data))
+check("TSV has no sequences", all(len(r) == len(common.EXPORT_COLUMNS) for r in data))
+check("FASTA: one record per hit, same order as the TSV",
+      len(fa_heads) == len(data) and [h[1:].split(" ")[0] for h in fa_heads] == [r[1] for r in data])
+check("FASTA: sequences are the hits' full sequences",
+      fa_seqs == [r[10] for r in expected])
+check("FASTA: header carries rank/evalue/bitscore",
+      all(h.split(" ")[1] == f"rank={i + 1}" and f"evalue={r[10]}" in h and f"bitscore={r[11]}" in h
+          for i, (h, r) in enumerate(zip(fa_heads, data))))
+check("FASTA has no comment lines", all(h.startswith(">") for h in fa_heads))
 check("by_origin sums to total", sum(summary["by_origin"].values()) == summary["total_hits"])
 check("by_evalue bands correct",
       all(summary["by_evalue"][f"{b:g}"] == sum(float(r[7]) <= b for r in rows_all)
           for b in common.EXPORT_EVALUE_BANDS), str(summary["by_evalue"]))
-check("summary points at the file", summary["files"]["hits_tsv_gz"]["key"] == f"results/{SID}_x/J/hits.tsv.gz")
-check("summary is an export, format 1.0", summary["kind"] == "export" and summary["export_format"] == "1.0")
-check("hits/summary/index all tagged reapable",
-      all(written[k].get("Tagging") == "reapable=true"
-          for k in (f"results/{SID}_x/J/hits.tsv.gz", f"results/{SID}_x/J.json", f"results/{SID}_x.index")))
-check("download named as an attachment", "attachment" in hits.get("ContentDisposition", ""))
+check("summary points at both files",
+      summary["files"]["hits_tsv_gz"]["key"] == f"results/{SID}_x/J/hits.tsv.gz"
+      and summary["files"]["hits_fasta_gz"]["key"] == f"results/{SID}_x/J/hits.fasta.gz"
+      and summary["files"]["hits_fasta_gz"]["bytes"] == len(fasta["Body"]))
+check("summary is an export, format 1.1", summary["kind"] == "export" and summary["export_format"] == "1.1")
+check("both files uploaded tagged reapable, as attachments",
+      all(u["ExtraArgs"]["Tagging"] == "reapable=true" and "attachment" in u["ExtraArgs"]["ContentDisposition"]
+          for u in (hits, fasta)))
+check("summary + index tagged reapable",
+      all(written[k].get("Tagging") == "reapable=true" for k in (f"results/{SID}_x/J.json", f"results/{SID}_x.index")))
 check("handler returns total", ret.get("num_results") == len(rows_all))
 check("timing.json written", f"results/{SID}_x/J/timing.json" in written)
+check("local files cleaned up", not any(os.scandir(aggregator.EXPORT_DIR)))
+
+bad = list(per_shard)
+bad[0] += 1
+try:
+    run_export_aggregator(bad)
+    check("row count must match the worker sidecars", False)
+except RuntimeError as e:
+    check("row count must match the worker sidecars", "sidecars" in str(e), str(e))
 
 print("\n=== export top N == search top N (same rows, same ranking) ===")
 search_top = sorted(({"target_id": r[0], "bitscore": float(r[8]), "evalue": float(r[7])} for r in rows_all),

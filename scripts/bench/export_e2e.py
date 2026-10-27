@@ -38,6 +38,12 @@ class S3Stub:
     def get_object(self, Bucket, Key):
         return {"Body": io.BytesIO(store[Key])}
 
+    def download_file(self, Bucket, Key, path):
+        open(path, "wb").write(store[Key])
+
+    def upload_file(self, path, Bucket, Key, Config=None, ExtraArgs=None):
+        store[Key] = open(path, "rb").read()
+
     def get_paginator(self, _):
         return types.SimpleNamespace(paginate=lambda Bucket, Prefix: [
             {"Contents": [{"Key": k} for k in sorted(store) if k.startswith(Prefix)]}])
@@ -110,6 +116,13 @@ for q in sys.argv[4:]:
     print(f"  export top {n} hits the capped search missed: {len(recovered)} {recovered[:5]}", flush=True)
     check("search size consistent with export total",
           n == min(common.RESULT_DEPTH, summary["total_hits"]), f"{n} vs {summary['total_hits']}")
+    fa = gzip.decompress(store[summary["files"]["hits_fasta_gz"]["key"]]).decode().splitlines()
+    check("FASTA: one record per row, same order, lengths == slen",
+          [h[1:].split(" ")[0] for h in fa[0::2]] == [r[1] for r in rows]
+          and all(len(q) == int(r[9]) for q, r in zip(fa[1::2], rows)))
+    seqs = {h["target_id"]: h["target_sequence"] for h in s_hits}
+    check("FASTA: search hits' sequences identical to the search's target_sequence",
+          all(seqs.get(h[1:].split(" ")[0], q) == q for h, q in zip(fa[0::2], fa[1::2])))
     check("header has total + release", any(f"total_hits: {len(rows)}" in l for l in header)
           and any("database_release: v260701" in l for l in header))
 

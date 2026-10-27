@@ -327,13 +327,16 @@ The search stops at `RESULT_DEPTH` per shard, so DIAMOND never computes the rest
 - **No state-machine change.** It rides `maxResults = 0` (`common.EXPORT_DEPTH`, DIAMOND's `-k 0` = no limit) through the existing Map; the orchestrator is the only producer of 0.
 - **Own sessionId** (`common.export_session_id`: `{sessionId}_x`), so a failed export writes its own `.error` and can't fail the search. The suffix is two characters because public execution names must fit in 80.
 - **Worker:** `-k 0`, columns `common.EXPORT_OUTFMT` (no sequences, plus `slen`), rows sorted by `common.export_rank_key` (the search's ranking: bitscore desc, e-value asc, then id), written as `parts/shard_N.tsv.gz`.
-- **Aggregator:** k-way merge of the 32 sorted parts into `results/{sessionId}_x/{jobId}/hits.tsv.gz`, plus the summary `results/{sessionId}_x/{jobId}.json` and `.index`. All are tagged `reapable=true`, so an export is a 14-day cache that is rebuilt on demand.
+- **Aggregator:** downloads the 32 sorted parts to `/tmp` and k-way merges them into `results/{sessionId}_x/{jobId}/hits.tsv.gz` and `hits.fasta.gz` (full sequences, same rank order), plus the summary `results/{sessionId}_x/{jobId}.json` and `.index`. All are tagged `reapable=true`, so an export is a 14-day cache that is rebuilt on demand.
 
-`hits.tsv.gz` (format `common.EXPORT_FORMAT_VERSION`, 1.0): commented `#` provenance lines (query, `database_release`/`database_version`, `search_version`, e-value cutoff, `dbsize`, `total_hits`, time), then a column row `rank target_id origin pident aln_len qstart qend sstart send slen evalue bitscore`, then one row per hit. The header is its own gzip member in front of the data member; `gzip`/`zcat`/pandas/R read that as one file. The summary JSON carries `total_hits`, `by_evalue` (hits at or below 1e-3/1e-10/1e-30/1e-50), `by_origin` (plasticome/ncbi_nr/logan from the `petadex_id` prefix) and the file key.
+Export format `common.EXPORT_FORMAT_VERSION` (1.1):
+- `hits.tsv.gz`: commented `#` provenance lines (query, `database_release`/`database_version`, `search_version`, e-value cutoff, `dbsize`, `total_hits`, time), then a column row `rank target_id origin pident aln_len qstart qend sstart send slen evalue bitscore`, then one row per hit.
+- `hits.fasta.gz`: one record per hit in the same order, `>petadex_id rank=… evalue=… bitscore=… pident=… origin=…` then the full sequence on one line; gzip level 1 (real protein text: 41 MB/s vs 14 MB/s at level 6, for a ~6% larger file).
+- The summary JSON carries `total_hits`, `by_evalue` (hits at or below 1e-3/1e-10/1e-30/1e-50), `by_origin` (plasticome/ncbi_nr/logan from the `petadex_id` prefix) and both file keys and sizes. A 1.0 export (TSV only) is treated as stale and rebuilt.
 
 **The export is the exact ranking; the search is very slightly approximate.** DIAMOND's `-k` is a heuristic: a capped run can skip a hit that belongs in its top K. In the end-to-end check on two real shards (`scripts/bench/export_e2e.py`, 2026-10-27), the search's top 500 for IsPETase missed one true top-500 hit (true rank 344, 220 bits; the top 100 was complete); five other queries matched exactly. Every hit the search returns is in the export with the same score.
 
-**Cost.** Per shard, an uncapped search took 1.2–2.2× the capped one (watson, 6 threads). The aggregator merge of the largest family measured 7.9M rows in ~50–100 s on one watson core, so the aggregator needs more than its 1,024 MB / 120 s for exports (planned: 2,048 MB, 600 s). Tests: `tests/test_export.py`.
+**Cost.** Per shard, an uncapped search took 1.2–2.2× the capped one (watson, 6 threads). Live (format 1.0): typical exports cost about the same as a search (~$0.17, ~46 s); the largest family (7.9M hits) 158 s, $0.34. With sequences the largest export is ~1.4 GB of FASTA; the aggregator runs at 2,048 MB, 600 s timeout, 6,144 MB `/tmp` (peak ~3.1 GB: parts + outputs). Tests: `tests/test_export.py`.
 
 ### Cleanup & lifecycle
 

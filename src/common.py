@@ -79,11 +79,12 @@ RESULT_DEPTH = 500
 # --- Export of ALL significant hits (on demand, separate from the search) ---
 #
 # The search above stops at RESULT_DEPTH per shard, so DIAMOND never computes
-# the rest. An export re-runs the fan-out with no hit cap (`-k 0`) and a light
-# output (no sequences), and the aggregator merges the 32 sorted parts into one
-# gzipped TSV plus a summary of counts. Measured on one v260701 shard: ~31k hits
-# (SRR10663367) to ~7.9M (a C003 query) at e <= 1e-3, at 1.2-2.2x the capped
-# search time — why it is opt-in rather than part of every search.
+# the rest. An export re-runs the fan-out with no hit cap (`-k 0`), and the
+# aggregator merges the 32 sorted parts into a gzipped TSV of every hit, a
+# gzipped FASTA of their full sequences in the same order, and a summary of
+# counts. Live (2026-10-27): ~31k hits (SRR10663367) to ~7.9M (a C003 query) at
+# e <= 1e-3; with sequences the largest export is ~1.5 GB — why it is opt-in
+# rather than part of every search.
 #
 # EXPORT_DEPTH rides the existing `maxResults` field through the state machine
 # (0 = DIAMOND's "no limit"), so exports need no ASL change. The orchestrator
@@ -95,10 +96,14 @@ EXPORT_DEPTH = 0
 EXPORT_SESSION_SUFFIX = "_x"
 # Version of the export file format (columns, header, summary), stamped into
 # every summary. Bump when a column or the summary shape changes.
-EXPORT_FORMAT_VERSION = "1.0"
-# DIAMOND columns the worker writes for an export part, in this order.
+#   1.0 — hits.tsv.gz + summary.
+#   1.1 — adds hits.fasta.gz (full target sequences, rank order); an export
+#         without it is stale and is rebuilt (orchestrator.find_export).
+EXPORT_FORMAT_VERSION = "1.1"
+# DIAMOND columns the worker writes for an export part, in this order. The full
+# target sequence is last; it goes to the FASTA, not the TSV.
 EXPORT_OUTFMT = ["sseqid", "qstart", "qend", "sstart", "send", "length",
-                 "pident", "evalue", "bitscore", "slen"]
+                 "pident", "evalue", "bitscore", "slen", "full_sseq"]
 # Columns of the merged file: rank + target id + origin, then the alignment.
 EXPORT_COLUMNS = ["rank", "target_id", "origin", "pident", "aln_len", "qstart",
                   "qend", "sstart", "send", "slen", "evalue", "bitscore"]
