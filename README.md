@@ -18,7 +18,7 @@ The default database became v260701 on 2026-10-27 (before that: the 307,155,746-
 
 The scale-out architecture replaced the single MMseqs2 Lambda with a **sharded, fan-out DIAMOND search** over the full corpus (today **v260701, 298,687,346 sequences**). The database is split into 32 shards, each searched in parallel by its own worker Lambda, with all shards resident on **S3** (not EFS). The web-app contract (event shape, result JSON, S3 keys) is preserved, so the cutover is a function-name swap on the caller's side.
 
-> **Status:** live. The web app was cut over from MMseqs2 to `petadex-diamond-orchestrator` on 2026-06-03, to 32 zstd shards on DIAMOND 2.2.2 on 2026-06-26, and to the v260701 database (`diamond/LATEST` = `petadex_seq_v260701_20261026_202443`) on 2026-10-27. The legacy MMseqs2 function was deleted 2026-10-27.
+> **Status:** live. The web app was cut over from MMseqs2 to `petadex-diamond-orchestrator` on 2026-06-03, to 32 zstd shards on DIAMOND 2.2.2 on 2026-06-26, and to the v260701 database (`diamond/LATEST` = `petadex_seq_v260701_20261026_202443`) on 2026-10-27. Since 2026-10-28 hits are enriched from the v260701 metadata store, carry `btop`, and every search gets a background alignment + tree (`search_version` 1.6.0). The legacy MMseqs2 function was deleted 2026-10-27.
 
 ### Why these choices
 
@@ -38,9 +38,10 @@ The scale-out architecture replaced the single MMseqs2 Lambda with a **sharded, 
 | **Orchestrator** | `petadex-diamond-orchestrator` | Validates + parses FASTA once, resolves the DB version, reads the shard manifest, mints `jobId`, returns `{job_id, s3_key}` immediately, and starts the Step Functions execution. Never block-waits. |
 | **State machine** | `petadex-diamond-search` (Step Functions) | A `Map` state fans out one worker per shard (`MaxConcurrency = SHARD_COUNT`). Per-branch retry on transient `Lambda.*` errors; `Catch: States.ALL` → fail-fast. Final state invokes the aggregator. |
 | **Worker** (×32 in parallel) | `petadex-diamond-worker` | Downloads its assigned `.fa.zst` shard to `/tmp` (cached per S3 key across warm invocations, evicting any other shard first), runs `diamond blastp`, writes a raw outfmt-6 TSV part to S3 (a sorted gzip part for an export). One worker per shard. |
-| **Aggregator** | `petadex-diamond-aggregator` | Merges all parts → sorts by bitscore desc / evalue asc → top-K → enriches from RDS once → writes the final result JSON + `.index` pointer in the unchanged schema. For an export, merges the uncapped parts into `hits.tsv.gz` + `hits.fasta.gz`. |
+| **Aggregator** | `petadex-diamond-aggregator` | Merges all parts → sorts by bitscore desc / evalue asc → top-K → enriches from the S3 metadata store → writes the final result JSON + `.index` pointer, then starts the align Lambda in the background. For an export, merges the uncapped parts into `hits.tsv.gz` + `hits.fasta.gz`. |
+| **Align** | `petadex-diamond-align` | FAMSA alignment + FastTree tree of the query and selected hits, after the result is written ([Alignment and tree](#alignment-and-tree)). Never blocks or fails a search. |
 
-All four share **one Docker image** (ARM64, DIAMOND built from source — no arm64 release binary exists); the Lambdas are distinguished by their `ImageConfig.Command` (`orchestrator.handler` / `worker.handler` / `aggregator.handler`). The `mmseqs` binary was removed from the image on 2026-06-26.
+All four share **one Docker image** (ARM64, DIAMOND built from source — no arm64 release binary exists); the Lambdas are distinguished by their `ImageConfig.Command` (`orchestrator.handler` / `worker.handler` / `aggregator.handler` / `align.handler`). The image also carries FAMSA 2.5.2 and FastTree 2.2.0. The `mmseqs` binary was removed from the image on 2026-06-26.
 
 ### Data flow
 
@@ -60,11 +61,13 @@ sequenceDiagram
     participant WA as Web app
     participant O as Orchestrator
     participant SF as Step Functions
-    participant W as Workers ×20
+    participant W as Workers ×32
     participant AG as Aggregator
+    participant AL as Align
     participant S3 as S3
 
-    WA->>O: search { sessionId, sequence }
+    WA->>O: search { sessionId, sequence, clientIp }
+    O->>O: admission limits + in-flight dedup
     O->>S3: read diamond/LATEST + manifest.json
     O->>SF: StartExecution(version, shards[])
     O-->>WA: { job_id, s3_key }  (immediate, ~1s)
@@ -78,10 +81,14 @@ sequenceDiagram
     end
 
     SF->>AG: aggregate (only after every part lands)
-    AG->>S3: read all 20 parts
-    AG->>AG: merge → sort → top-K → enrich (RDS)
+    AG->>S3: read all 32 parts
+    AG->>AG: merge → sort → top-K
+    AG->>S3: enrich from metadata store (~1.5–3 s)
     AG->>S3: write {jobId}.json + .index + timing.json
+    AG-)AL: invoke (async)
     WA->>S3: poll finds .index → fetch result
+    AL->>S3: FAMSA + FastTree → alignments/{sid}/{jid}/
+    WA->>O: align { sessionId } → afa + newick when ready
 ```
 
 ### Sharded database on S3
@@ -114,10 +121,12 @@ Earlier builds (`catalytic_orfs_v1.1_*`, 20 `.dmnd` shards until 2026-06-26, the
 | Worker `/tmp` | **10240 MB** | holds one ~0.8 GB shard (cached per S3 key) + query + output; an uncapped export part is up to ~100 MB |
 | Worker timeout | **600 s** | a normal shard takes ~30–45 s; the slowest export shard measured 116 s |
 | Worker reserved concurrency | **200** | 32 workers per search; the orchestrator admits at most 4 running public searches (128 workers) |
+| Orchestrator | **512 MB / 30 s**, reserved concurrency **2** | serializes the admission check-then-start (see [Public-search limits](#public-search-limits--alarms)) |
+| Align | **4096 MB / 300 s** | FAMSA + FastTree, ~10 s for ISPETase |
 | Aggregator | **2048 MB / 600 s / 6144 MB `/tmp`** | sized for the export merge (7.9M rows + 1.4 GB FASTA in ~3 min); a normal aggregation takes ~3 s |
 | Sensitivity | **default** (no flag) | recall-for-speed trade chosen 2026-06-04 over the Phase-0 `--very-sensitive` lock (~34 s vs ~170 s per shard). Env `DIAMOND_SENSITIVITY` overrides (empty/`default`/`none` ⇒ no flag). Re-validate parity if distant homologs matter. |
 | `-b` (block size) | **1** | bounds RAM, not disk |
-| Per-shard timing | download ~8 s, search ~21–33 s (default sensitivity) | job wall ~43–58 s end to end (v260701, 2026-10-27) |
+| Per-shard timing | download ~8 s, search ~21–33 s (default sensitivity) | job wall ~47–50 s end to end incl. ~3 s enrichment (v260701, 1.6.0, 2026-10-28) |
 
 ### Warm cache, cold starts & the download lever
 
@@ -153,8 +162,8 @@ Every search is labelled by **two independent version axes**, both stamped into 
 
 | Axis | Result field(s) | What it tracks | Changes when |
 |---|---|---|---|
-| **Database** | `database_release` (`v1.1`, human label) + `database_version` (`catalytic_orfs_v1.1_20260602_222538`, precise build tag) | The corpus searched against. `database_release` is parsed from the corpus filename (`petadex.catalytic_orfs.v1.1.fa`) and labels every shard via the manifest; `database_version` pins the exact build. | The corpus is rebuilt/republished (new data, re-sharding) — `database_version` changes on *every* rebuild; `database_release` only on a semantic bump (`v1.1` → `v1.2`). |
-| **Search** | `search_version` (`1.0.0`, semver) | The search pipeline — engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](src/common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus — e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, or a scoring change. |
+| **Database** | `database_release` (`v260701`, human label) + `database_version` (`petadex_seq_v260701_20261026_202443`, precise build tag) | The corpus searched against. `database_release` is parsed from the corpus filename (`PETadex.seq.v260701.fa`) and labels every shard via the manifest; `database_version` pins the exact build. | The corpus is rebuilt/republished (new data, re-sharding) — `database_version` changes on *every* rebuild; `database_release` only on a new release (`v1.1` → `v260701`). |
+| **Search** | `search_version` (`1.6.0`, semver) | The search pipeline — engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](src/common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus — e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, a scoring change, or a payload change (1.5.0 metadata store, 1.6.0 `btop`). |
 
 Both axes are needed because either one alone leaves a staleness hole: a corpus bump invalidates results the database axis catches, but a pipeline change (same corpus, different sensitivity) is invisible to it — that's what `search_version` covers.
 
@@ -170,8 +179,8 @@ The key must encode the versions a *fresh* search **would** run with (current co
 
 ```jsonc
 // request:  { "action": "version" }   (no sessionId — it's what you call to BUILD one)
-// response: { "database_version": "catalytic_orfs_v1.1_20260602_222538",
-//             "database_release": "v1.1", "search_version": "1.4.0",
+// response: { "database_version": "petadex_seq_v260701_20261026_202443",
+//             "database_release": "v260701", "search_version": "1.6.0",
 //             "result_depth": 500 }
 ```
 
@@ -201,11 +210,12 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `num_results` | int | Number of hits actually found and stored (equals `len(results)`). Capped by `result_depth`; when it is **less**, the e-value floor was reached first — the search was exhaustive. |
 | `result_depth` | int | **Depth this job searched to** — the per-shard `-k` and the final truncation limit (`RESULT_DEPTH` in [common.py](src/common.py)). A cached result can serve any display count up to this; a deeper request must re-run. Added in `search_version` 1.4.0. See [Result depth](#result-depth--variable-display-count). |
 | `engine` | string | Search engine — always `diamond` on this path. |
-| `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`). |
+| `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/diamond/corpus/PETadex.seq.v260701.fa`). |
 | `database_release` | string \| null | **Human-facing corpus version**, e.g. `v260701` (earlier `v1.1`) (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
-| `database_version` | string | **Precise build tag** of the corpus (e.g. `catalytic_orfs_v1.1_20260602_222538`). Pins the result to one exact build of a release — changes on *every* rebuild, even within the same `database_release`. This is the corpus identifier the cache key should use. |
-| `search_version` | string | **Search-pipeline version** (semver, e.g. `1.0.0`) — independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
-| `db_sequence_count` | int | **Sequence** count across all shards (307,155,746). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is a **residue** count (~105B residues ≈ 341.65 × 307,155,746 sequences; see Scoring & e-values). |
+| `database_version` | string | **Precise build tag** of the corpus (e.g. `petadex_seq_v260701_20261026_202443`). Pins the result to one exact build of a release — changes on *every* rebuild, even within the same `database_release`. This is the corpus identifier the cache key should use. |
+| `search_version` | string | **Search-pipeline version** (semver, e.g. `1.6.0`) — independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
+| `db_sequence_count` | int | **Sequence** count across all shards (298,687,346). This is the corpus size for reference — it is *not* the e-value `--dbsize`, which is a **residue** count (88.18B residues ≈ 295.2 × 298,687,346 sequences; see Scoring & e-values). |
+| `enrichment_status` · `metadata_version` · `clusters` · `summary` | | Metadata-store enrichment (1.5.0+); see [Metadata enrichment](#metadata-enrichment). |
 | `results` | array | Hit list, ranked by bit-score descending, then e-value ascending. |
 
 **Per-hit object (each element of `results`):**
@@ -223,7 +233,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `bitscore` | float | DIAMOND bit-score. **Primary ranking key.** |
 | `target_sequence` | string \| null | **Full amino-acid sequence of the matched target** (DIAMOND's `full_sseq`) — the complete subject protein, not just the aligned segment, so it is typically longer than `alignment_length`. Added in `search_version` 1.3.0; `null` only for a hit merged from a part written by an older worker. |
 | `btop` | string | DIAMOND's Blast trace-back over `query_start`–`query_end` / `target_start`–`target_end` (1.6.0+): a number = that many identical residues, a letter pair = query then target residue at a mismatch, `-` = gap. A target letter may read `X` where DIAMOND masked a low-complexity stretch; take the residue from `target_sequence`. ISPETase: 500/500 hits rebuild exactly; ~80 KB per 500 hits. |
-| `metadata` | object \| null | RDS-enriched annotation; `null` when the target has no RDS match (the usual case for Logan ORF IDs — see below). |
+| `metadata` | object \| null | The hit's card from the metadata store (1.5.0+; see [Metadata enrichment](#metadata-enrichment)); `null` when the id isn't in the store. |
 
 Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both query and target.
 
@@ -239,7 +249,7 @@ Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both qu
 
 > ⚠️ Fields 4–7 are **not authoritatively defined in this repo** — the build script is a passthrough, so their exact meaning must be confirmed against the upstream Logan corpus specification before relying on them. Consumers should treat the whole `target_id` as an opaque key and split it only for display.
 
-**`metadata` when populated.** Enrichment joins `blast_nr_metadata` on `genbank_accession_id`. Logan ORF IDs are not GenBank accessions, so they don't match and `metadata` is `null` for essentially all Logan hits (this is expected, not a failure). When a target *does* match (e.g. a reference/nr accession), `metadata` is an object with: `genbank_accession_id`, `organism`, `protein_id`, `definition`, `taxonomy`, `journal`, `collection_date`, `country` (all strings, individually nullable).
+**v260701 ids.** Since v260701 the corpus headers are bare `petadex_id`s whose prefix gives the origin: `PL…` Plasticome (PAZy), `NR…` NCBI nr, `LG…` Logan. The 7-field format above applies to v1.1 results.
 
 #### Timing diagnostic schema (`results/{sessionId}/{jobId}/timing.json`)
 
@@ -256,7 +266,7 @@ A side-car rollup written **beside** the result (not inside it), so it survives 
 | `submitted_at` | string (ISO 8601) | Job submission timestamp (start of the wall clock). |
 | `completed_at` | string (ISO 8601) | Rollup-write timestamp. |
 | `total_wall_ms` | float \| null | End-to-end wall time from `submitted_at`, in ms. |
-| `shard_count` | int | Number of shards the corpus is split into (20). |
+| `shard_count` | int | Number of shards the corpus is split into (32). |
 | `shards_expected` | int | Shards the job expected to report. |
 | `shards_completed` | int | Shards that completed successfully. Equality with `shards_expected` is the fail-fast completeness check. |
 | `slowest_shard_ms` | float \| null | Max per-shard `total_ms` (≈ `total_wall_ms`). |
@@ -271,7 +281,7 @@ A side-car rollup written **beside** the result (not inside it), so it survives 
 |---|---|---|
 | `read_parts_ms` | float | Time reading + parsing all shard parts from S3. |
 | `sort_ms` | float | Time for the global bitscore/evalue ranking + top-K. |
-| `metadata_ms` | float | Time for the RDS metadata enrichment round-trip. |
+| `metadata_ms` | float | Time for the metadata-store enrichment (~3.1–3.3 s live). |
 | `write_result_ms` | float | Time writing the combined result + `.index` to S3. |
 | `total_ms` | float | Sum of the aggregator phases. |
 
@@ -362,6 +372,17 @@ After every search result is written, the aggregator starts a fourth Lambda, `pe
 - **Cost.** ISPETase (125 sequences, 660 columns, 2 threads): FAMSA 0.7 s + FastTree 8.8 s; 83 KB alignment, 4 KB tree; about $0.0005 per search at 4096 MB. IQ-TREE was benchmarked and rejected for this path: `-fast` took 21 s, its default search ~20 min.
 - **Setup (once, admin).** After the image with `align.py` is deployed: `ACCOUNT_ID=… ./scripts/deploy/provision_align.sh` (role, function, invoke grants, `ALIGN_FUNCTION` on the aggregator and orchestrator), then add the function to the CI role (`infra/iam/github-actions-deploy-update.json`); until then the deploy step skips it with a notice.
 
+### Public-search limits & alarms
+
+A search or export event with `clientIp` (sent by the petadex.io backend) must pass `check_admission` in the orchestrator; direct invokes without it skip the check. One `ListExecutions` sweep answers all of it:
+
+- **In-flight dedup first.** If a RUNNING execution already has this `sessionId`, the response is that job's `{job_id, s3_key, deduped: true}` and nothing starts (never a 429).
+- **Limits** (env, defaults): `MAX_RUNNING_JOBS` 4 (4 × 32 = 128 of 200 reserved workers), `MAX_JOBS_PER_IP_PER_HOUR` 10, `MAX_JOBS_PER_HOUR` 30, `MAX_JOBS_PER_DAY` 100. The per-client count uses an 8-hex IP hash prefixed onto the execution name. A refusal returns **429**; if the sweep itself fails, **503** (fail closed).
+- **Race bound.** Orchestrator reserved concurrency is 2, so a burst can't all pass the check-then-start at once.
+- **Alarms.** `petadex-search-{worker-throttles,unavailable,refused}` → SNS `petadex-search-alarms` → `petadex-search-alarm-notifier` ([infra/alarms/ntfy_notifier.py](infra/alarms/ntfy_notifier.py)) → ntfy push. Set up by [scripts/ops/setup_search_alarms.sh](scripts/ops/setup_search_alarms.sh) (idempotent). The unavailable/refused alarms match the orchestrator's `Admission denied (<limit>)` log line; keep that text stable.
+
+Tests: `tests/test_admission.py`.
+
 ### Cleanup & lifecycle
 
 Each search writes an immutable, `jobId`-addressed result tree under `results/{sessionId}/{jobId}/`, and `results/{sessionId}.index` is overwritten to point at the newest `jobId`. Nothing garbage-collects the previous `jobId` trees, and version-aware re-keying (above) deliberately orphans every prior `sessionId` — so without reaping, the bulky per-shard `parts/*.tsv` + `*.meta.json` and `timing.json` accumulate indefinitely.
@@ -377,9 +398,9 @@ These objects are **write-once-then-dead** the moment `{jobId}.json` exists — 
 
 `percent_identity` (0–100), `bitscore`, and the alignment coordinates are taken straight from DIAMOND. Results are ranked by **bitscore** (tiebreak: e-value), which is correct across shards because a bit score depends only on the scoring system, not database size.
 
-**E-values, however, scale with database size** — so a shard searched in isolation would report e-values calibrated against only ~1/20 of the corpus (≈20× too significant). To fix this, every worker is given `--dbsize <total corpus residues>` (the manifest's `total_letters`, threaded orchestrator → worker), so e-values are calibrated against the **full corpus** and match a single full-database search. Bit scores are unaffected. (Engineering detail in `docs/evalue-calibration.md`; if a manifest lacks `total_letters`, workers omit `--dbsize` and fall back to per-shard e-values.)
+**E-values, however, scale with database size** — so a shard searched in isolation would report e-values calibrated against only ~1/32 of the corpus (≈32× too significant). To fix this, every worker is given `--dbsize <total corpus residues>` (the manifest's `total_letters`, threaded orchestrator → worker), so e-values are calibrated against the **full corpus** and match a single full-database search. Bit scores are unaffected. (Engineering detail in `docs/evalue-calibration.md`; if a manifest lacks `total_letters`, workers omit `--dbsize` and fall back to per-shard e-values.)
 
-> **`--dbsize` is a residue count, not a sequence count — these are *not* expected to match.** DIAMOND's `--dbsize` is the number of *letters* (amino-acid residues) in the reference, used for Karlin-Altschul statistics. The live value is `--dbsize 104940484545` (~105 billion residues), whereas `db_sequence_count` is `307,155,746` (the number of *sequences*). They reconcile exactly: 104,940,484,545 ÷ 307,155,746 ≈ **341.65 residues per sequence** — a normal mean protein length. Seeing ~105B beside ~307M is therefore correct, not a bug. (The 105B figure for the current build is a striped-sample estimate, tagged `total_letters_source: striped-sample-estimate` in the manifest.)
+> **`--dbsize` is a residue count, not a sequence count — these are *not* expected to match.** DIAMOND's `--dbsize` is the number of *letters* (amino-acid residues) in the reference, used for Karlin-Altschul statistics. The live value (v260701) is `--dbsize 88181580142` (~88 billion residues, counted exactly at build time), whereas `db_sequence_count` is `298,687,346` (the number of *sequences*). They reconcile: 88,181,580,142 ÷ 298,687,346 ≈ **295.2 residues per sequence** — a normal mean protein length. Seeing ~88B beside ~299M is therefore correct, not a bug.
 
 ### Telemetry
 
@@ -412,11 +433,11 @@ All Lambda roles share one ARM64 Docker image, dispatched by `ImageConfig.Comman
 ```
 petadex-sequence-search/
 ├── src/                          # Lambda code — copied flat into the image's task root
-│   ├── orchestrator.py           # DIAMOND: validate, resolve version, start Step Functions (search/history/version)
+│   ├── orchestrator.py           # validate, admission + dedup, start Step Functions; actions search/export/history/version/samples/align
 │   ├── worker.py                 # DIAMOND: download one shard, run diamond blastp, write TSV part
-│   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
+│   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing → start align
 │   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
-│   ├── metadata.py               # Tier-A enrichment: hit cards + summary from the metadata store
+│   ├── metadata.py               # hit cards + summary from the metadata store; Found-in-Samples lookups
 │   ├── align.py                  # alignment + tree after each search (FAMSA + FastTree), read via the `align` action
 │   └── cli.py                    # Local DIAMOND search against any local DB (no AWS; JSON to stdout)
 ├── data/
@@ -424,12 +445,14 @@ petadex-sequence-search/
 ├── infra/
 │   ├── search_state_machine.asl.json   # Step Functions Map definition (worker fan-out → aggregator)
 │   ├── architecture.d2 / architecture.svg  # data-flow diagram (source + render)
-│   └── iam/                      # least-privilege role policies per Lambda
+│   ├── alarms/ntfy_notifier.py   # SNS → ntfy relay for the search alarms
+│   └── iam/                      # least-privilege role policies per Lambda (+ CI deploy role)
 ├── scripts/
 │   ├── db/                       # Build & maintain the sharded database
 │   │   ├── build_diamond_shards.py       # Builds the sharded DIAMOND DB from a corpus FASTA (zstd shards build on any Linux box)
 │   │   ├── assemble_v260701_corpus.py    # v260701 full-length + core corpora (>petadex_id headers)
 │   │   ├── build_metadata_store.py       # v260701 metadata store for enrichment (runs on EC2)
+│   │   ├── build_samples_store.py        # v260701 Found-in-Samples store (runs on EC2)
 │   │   ├── verify_v260701_corpus.sh      # Record-by-record check of those corpora against the source files
 │   │   ├── run_v260701_rebuild.sh        # Unattended v260701 run: verify → build/upload → checks → pinned validation
 │   │   ├── backfill_manifest_letters.py  # Populate manifest total_letters (e-value --dbsize) without a rebuild
@@ -440,12 +463,20 @@ petadex-sequence-search/
 │   │   ├── provision_align.sh            # One-time admin: the alignment + tree Lambda (src/align.py)
 │   │   ├── set_worker_env.py             # Update worker env vars without clobbering the rest
 │   │   ├── smoke_test.sh                 # Invoke the live orchestrator and poll for the result
+│   │   ├── validate_export.py            # Live export check against the deployed functions
 │   │   └── validate_pinned_version.py    # Site examples pinned to a version vs LATEST; fails on cross-version hits
+│   ├── ops/setup_search_alarms.sh        # Idempotent alarm + SNS + ntfy relay setup
+│   ├── batch/                    # Many-protein batch search: 32 direct worker invokes, multi-query FASTA
 │   ├── bench/                    # Benchmarks against the live/devtest stack
 │   │   ├── bench_result_depth.py         # Search cost vs result depth (-k)
 │   │   ├── bench_full_vs_cores.sh        # Full-length vs catalytic-core search DB (v260701 decision)
+│   │   ├── export_e2e.py                 # Export vs capped search on real shards (-k heuristic check)
+│   │   ├── sensitivity_recall.py         # default vs --very-sensitive recall by identity bin
 │   │   └── stage2_devtest_runbook.sh, stage3_ab.py, stage3_fanout.py  # dev-build A/B harness
 │   └── README.md
+├── tests/                        # Script tests (run with .venv/bin/python): admission, align, cli, export,
+│   │                             #   metadata, result_depth, shard_cache
+│   └── fixtures/                 # Real 1.5.0 ISPETase result + samples responses
 ├── docker/
 │   └── Dockerfile.dev            # Dev-build worker image (pre-staged DIAMOND source)
 ├── docs/                         # cutover.md, publishing.md
@@ -461,7 +492,7 @@ petadex-sequence-search/
 
 ## Lambda API
 
-The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which accepts four actions via the event body. The contract is unchanged from the legacy path, so callers needed only a function-name swap.
+The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which accepts seven actions via the event body: `search`, `export`, `history`, `version`, `samples`, `align` (below; `samples` and `align` are detailed under [Metadata enrichment](#metadata-enrichment) and [Alignment and tree](#alignment-and-tree)). The contract is unchanged from the legacy path, so callers needed only a function-name swap.
 
 **Search** — validates the query, starts the Step Functions execution, and returns immediately (the aggregator publishes the result minutes later; the caller polls `results/{sessionId}.index`):
 ```json
@@ -469,10 +500,13 @@ The web app invokes the **orchestrator** (`petadex-diamond-orchestrator`), which
   "action": "search",
   "sessionId": "abc123",
   "sequence": "MKLLIVLLAACLAVFAAAEPQIAVV",
-  "max_results": 50
+  "max_results": 50,
+  "clientIp": "203.0.113.7"
 }
 ```
 
+> `clientIp` is optional; when present the request goes through [admission](#public-search-limits--alarms) (429 / 503 on refusal), and a duplicate of a running search returns that job with `"deduped": true`.
+>
 > `max_results` is accepted but **presentational only** — every job searches to the fixed `RESULT_DEPTH` (see [Result depth](#result-depth--variable-display-count)) and the caller subsets at view time. It is not part of the cache key and does not change what is searched or stored.
 
 Response:
@@ -540,9 +574,9 @@ Response:
 Response:
 ```json
 {
-  "database_version": "catalytic_orfs_v1.1_20260602_222538",
-  "database_release": "v1.1",
-  "search_version": "1.4.0",
+  "database_version": "petadex_seq_v260701_20261026_202443",
+  "database_release": "v260701",
+  "search_version": "1.6.0",
   "result_depth": 500
 }
 ```
@@ -554,7 +588,7 @@ Response:
 One ARM64 image serves all roles. Pushes to `main` build and deploy via GitHub Actions (`deploy.yml`):
 1. Bumps the semver tag
 2. Builds a `linux/arm64` image (on a native arm64 runner, with GHA layer cache — the DIAMOND source compile is slow under QEMU) and pushes to ECR
-3. `update-function-code` on the three DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator}`), then updates the Step Functions state-machine definition. Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
+3. `update-function-code` on the four DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator,align}`), then updates the Step Functions state-machine definition (the CI role can't yet, so apply ASL changes by hand). Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
 4. Regenerates the example searches.
 
 **One-time provisioning** (admin IAM, not the CI/build role) creates the 3 DIAMOND Lambdas, the `petadex-diamond-search` state machine, and their IAM roles from the same image:
@@ -577,7 +611,7 @@ docker tag petadex-search:latest \
 docker push YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/petadex-mmseq2-search:latest
 
 # Re-point each function at the new image (container Lambdas pin an immutable digest)
-for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-aggregator; do
+for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-aggregator petadex-diamond-align; do
   aws lambda update-function-code --function-name "$FN" \
     --image-uri YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/petadex-mmseq2-search:latest
 done
@@ -630,7 +664,8 @@ No Lambda redeployment is needed — each worker resolves `LATEST` per job and p
 
 ## Input Validation
 
-- Valid amino acids: `ACDEFGHIKLMNPQRSTVWY`
+- Valid amino acids: `ACDEFGHIKLMNPQRSTVWY` plus IUPAC ambiguity codes `BJZXUO`
+- Stop codons (`*`) and gap characters (`-`) are stripped silently
 - Minimum length: 10 amino acids
 - Maximum length: 10,000 amino acids
 
@@ -638,10 +673,11 @@ No Lambda redeployment is needed — each worker resolves `LATEST` per job and p
 
 ## Tech Stack
 
-- **Search**: DIAMOND2 `blastp` (scale-out, now serving the web app) · MMseqs2 `easy-search` (legacy single-Lambda, deployed but no longer serving; removal pending Phase 7)
+- **Search**: DIAMOND 2.2.2 `blastp` (source-built with zstd) · **Alignment/tree**: FAMSA 2.5.2 + FastTree 2.2.0
 - **Runtime**: Python 3.11 on AWS Lambda ARM64 (Graviton)
-- **Coordination**: AWS Step Functions (`Map` fan-out) across orchestrator / worker / aggregator Lambdas
-- **Storage**: Amazon S3 (`petadex` bucket) — sharded `.fa.zst` database + results + exports
-- **Enrichment**: PETadex RDS (PostgreSQL) `blast_nr_metadata`
+- **Coordination**: AWS Step Functions (`Map` fan-out) across orchestrator / worker / aggregator Lambdas, plus an async align Lambda
+- **Storage**: Amazon S3 (`petadex` bucket) — sharded `.fa.zst` database, metadata + samples stores, results, exports, alignments
+- **Enrichment**: v260701 metadata store on S3 (gzipped NDJSON blocks; RDS no longer used by search)
+- **Ops**: CloudWatch alarms → SNS → ntfy
 - **CI/CD**: GitHub Actions → ECR → Lambda
 - **Database source**: PETadex v260701 full-length catalytic proteins, 298.7M sequences (since 2026-10-27; v1.1 Logan corpus, 307M, before)

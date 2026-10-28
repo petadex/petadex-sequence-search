@@ -18,7 +18,7 @@ vars: {
     compute: "Compute — Lambda / Step Functions" {
       style: { fill: "#3b2f12"; stroke: "#f59e0b"; text-transform: none }
     }
-    store: "Storage — S3 / RDS" {
+    store: "Storage — S3" {
       shape: cylinder
       style: { fill: "#1f2937"; stroke: "#60a5fa"; text-transform: none }
     }
@@ -35,39 +35,45 @@ vars: {
 
 wa: "🌐 PETadex web app" { shape: oval }
 
-orch: "⚙️ Orchestrator Lambda\n\n• validate + parse FASTA once\n• read diamond/LATEST → version\n• read manifest.json → shard list\n• mint jobId · StartExecution" {
+orch: "⚙️ Orchestrator Lambda\n\n• validate + parse FASTA once\n• admission limits · in-flight dedup\n• read diamond/LATEST → version + manifest\n• mint jobId · StartExecution\n• also: version · history · export · samples · align" {
   style.text-transform: none
 }
 
-s3db: "🗄️ S3 · diamond/{version}/\n20 × shard_NN.dmnd + manifest" { shape: cylinder }
+s3db: "🗄️ S3 · diamond/{version}/\n32 × shard_NN.fa.zst + manifest" { shape: cylinder }
 
-sfn: "🔀 Step Functions · Map — 20 workers / search\n(reserved concurrency 100 ⇒ ≤ 5 searches at once)" {
+sfn: "🔀 Step Functions · Map — 32 workers / search\n(reserved concurrency 200 · ≤ 4 public searches at once)" {
   direction: right
   w0: "Worker\nshard 0"
   w1: "Worker\nshard 1"
   w2: "Worker\nshard 2"
   wdots: "…" { shape: text }
-  w18: "Worker\nshard 18"
-  w19: "Worker\nshard 19"
+  w30: "Worker\nshard 30"
+  w31: "Worker\nshard 31"
 }
 
 parts: "🗄️ S3 · results/{sid}/{jid}/parts/\nshard_N.tsv + shard_N.meta.json" { shape: cylinder }
 
-agg: "🧬 Aggregator Lambda · final Map state\n\n• merge parts · assert 0 ≤ pident ≤ 100\n• sort bitscore↓ / evalue↑ · top-K\n• fetch_metadata (once)\n• write result + index + timing" {
+agg: "🧬 Aggregator Lambda · final Map state\n\n• merge parts · assert 0 ≤ pident ≤ 100\n• sort bitscore↓ / evalue↑ · top-K\n• enrich from metadata store\n• write result + index + timing\n• start align (async)" {
   style.text-transform: none
 }
 
-rds: "🛢️ RDS · blast_nr_metadata" { shape: cylinder }
+meta: "🗄️ S3 · metadata/v260701/\nhit cards + Found-in-Samples" { shape: cylinder }
+align: "🌳 Align Lambda\n\n• FAMSA alignment\n• FastTree tree" {
+  style.text-transform: none
+}
+aln: "🗄️ S3 · alignments/{sid}/{jid}/\n.afa + .nwk" { shape: cylinder }
 result: "🗄️ S3 · results/{sid}/{jid}.json\n+ results/{sid}.index + timing.json" { shape: cylinder }
 
-wa -> orch: "{ action, sessionId, sequence, max_results }"
+wa -> orch: "{ action, sessionId, sequence, max_results, clientIp }"
 orch -> wa: "{ job_id, s3_key } immediately" { style.stroke-dash: 4 }
 orch <-> s3db: "read LATEST + manifest"
 orch -> sfn: "StartExecution"
 s3db -> sfn: "download shard → /tmp (evict prior)"
 sfn -> parts: "diamond blastp (default)"
 parts -> agg
-agg <-> rds: enrich
+agg <-> meta: enrich
+agg -> align: "invoke (async)" { style.stroke-dash: 4 }
+align -> aln
 agg -> result
 wa -> result: "poll .index → fetch result JSON" { style.stroke-dash: 4 }
 
@@ -78,4 +84,6 @@ agg.style: { fill: "#3b2f12"; stroke: "#f59e0b" }
 s3db.style: { fill: "#1f2937"; stroke: "#60a5fa" }
 parts.style: { fill: "#1f2937"; stroke: "#60a5fa" }
 result.style: { fill: "#1f2937"; stroke: "#60a5fa" }
-rds.style: { fill: "#1f2937"; stroke: "#60a5fa" }
+meta.style: { fill: "#1f2937"; stroke: "#60a5fa" }
+align.style: { fill: "#3b2f12"; stroke: "#f59e0b" }
+aln.style: { fill: "#1f2937"; stroke: "#60a5fa" }
