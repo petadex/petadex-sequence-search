@@ -49,7 +49,12 @@ import re
 #           `enrichment_status`, `metadata_version`, `clusters` and `summary`.
 #           Same hits and ranking, different payload, so this MUST bump: a cached
 #           1.4.0 result has `metadata: null` on every hit.
-SEARCH_VERSION = "1.5.0"
+#   1.6.0 — Hits carry `btop`, DIAMOND's Blast trace-back of the alignment (the
+#           worker appends the column after full_sseq), so the web app can draw
+#           query-vs-hit residues and a conservation track. Same hits and
+#           ranking, ~100 KB more per 500-hit result; bump so cached 1.5.0
+#           results (no btop) are not served.
+SEARCH_VERSION = "1.6.0"
 
 # Depth of the SEARCH itself — how many hits every job computes and stores,
 # regardless of how many the caller asks to display. Set once here, injected by

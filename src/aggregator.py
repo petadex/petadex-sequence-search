@@ -52,12 +52,13 @@ def parse_part(text):
     """Parse one shard part (DIAMOND outfmt-6 TSV text) into result dicts.
 
     DIAMOND outfmt-6 column order (set by the worker):
-        sseqid qstart qend sstart send length pident evalue bitscore full_sseq
+        sseqid qstart qend sstart send length pident evalue bitscore full_sseq btop
 
-    `full_sseq` (column 10) is the FULL target protein sequence, appended last by
-    the worker so this parser stays backward-compatible: a part written by an
-    older worker has only 9 columns and yields `target_sequence: None` rather
-    than failing the merge (which, under fail-fast, would fail the whole job).
+    `full_sseq` (column 10) is the FULL target protein sequence and `btop` (column
+    11) the alignment's Blast trace-back, each appended last by the worker so this
+    parser stays backward-compatible: a part from an older worker has 9 or 10
+    columns and yields `target_sequence` / `btop` None rather than failing the
+    merge (which, under fail-fast, would fail the whole job).
 
     Pure (no S3), so the local CLI parses its output with exactly this code.
     """
@@ -85,6 +86,11 @@ def parse_part(text):
             # Full target amino-acid sequence (DIAMOND `full_sseq`).
             # None for parts written by a pre-full_sseq worker.
             "target_sequence": p[9] if len(p) > 9 else None,
+            # DIAMOND `btop` over query_start..query_end: digits = identical run,
+            # a letter pair = query/target residue ("-" for a gap). A target letter
+            # can be "X" where DIAMOND masked low complexity; the true residue is in
+            # target_sequence at that position. None if pre-1.6.0.
+            "btop": p[10] if len(p) > 10 else None,
         })
     return results
 

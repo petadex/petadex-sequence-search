@@ -155,7 +155,7 @@ check("export columns + slen, full_sseq last",
       cmd[cmd.index("--outfmt") + 1:] == ["6", *common.EXPORT_OUTFMT], str(cmd[cmd.index("--outfmt"):]))
 with mock.patch.object(worker.subprocess, "run", side_effect=fake_run):
     worker.run_shard_search(">q\nMKL\n", "/tmp/shard_x.fa.zst", 500, dbsize=88181580142)
-check("search keeps full_sseq", seen["cmd"][-1] == "full_sseq")
+check("search keeps full_sseq, then btop last", seen["cmd"][-2:] == ["full_sseq", "btop"], str(seen["cmd"][-3:]))
 
 puts = {}
 with mock.patch.object(worker, "download_shard", return_value="/tmp/shard_x.fa.zst"), \

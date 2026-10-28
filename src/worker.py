@@ -129,8 +129,11 @@ DBSIZE_ENV = os.environ.get("DIAMOND_DBSIZE")
 # 116 GB and unindexed by ORF ID, so a post-hoc lookup in the aggregator is not
 # viable, whereas DIAMOND already holds the subject sequence in the reference
 # block it just searched. Costs ~1 sequence-worth of TSV per hit (≈50 rows/shard).
+# `btop` (DIAMOND's Blast trace-back: run lengths of matches, plus a query/target
+# residue pair per mismatch or gap) follows it for the same reason, appended last;
+# it spells the alignment over query_start..query_end / target_start..target_end.
 OUTFMT = ["6", "sseqid", "qstart", "qend", "sstart", "send",
-          "length", "pident", "evalue", "bitscore", "full_sseq"]
+          "length", "pident", "evalue", "bitscore", "full_sseq", "btop"]
 
 # Mirror the multipart tuning the legacy download path uses.
 S3_DOWNLOAD_CONCURRENCY = 32
