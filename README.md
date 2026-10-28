@@ -352,6 +352,16 @@ The aggregator enriches the top hits from a **metadata store** in S3 (`METADATA_
 - **Examples.** A real 1.5.0 result (ISPETase, 500 hits) and a `samples` response are in [`tests/fixtures/`](tests/fixtures/).
 - **Versioning.** A new store build changes the payload for the same hits, so pointing `METADATA_STORE` at a new store should come with a `SEARCH_VERSION` bump, exactly as a sensitivity change does.
 
+### Alignment and tree
+
+After every search result is written, the aggregator starts a fourth Lambda, `petadex-diamond-align` ([`src/align.py`](src/align.py)), in the background. It aligns the query, every Plasticome hit and the best-ranked hit of each 90 % cluster (capped at 200 hits, in rank order) with **FAMSA**, and builds a tree with **FastTree** (`-lg -gamma`). The search never waits for it and never fails because of it; sequences come from the result itself (`query_sequence`, each hit's `target_sequence`), not the corpus.
+
+- **Reading it.** `{"action": "align", "sessionId": "…", "jobId": "…"}` (jobId defaults to the session's latest) returns `status` none / running / ready / failed; when ready it also carries `afa` (aligned FASTA; headers are petadex_ids, the query is `>query`) and `newick` (same leaf names, branch lengths kept), plus `ids`, `n_columns`, `timing` and the result's versions. A missing or failed default alignment is restarted on request; `"poll": true` only reads.
+- **Custom selection.** Add `"ids": [...]` (≤ 200 hits of that result, any order) to align a filtered set; it is started on first request and cached under a hash of the id set. Responses: 200 any status, 400 bad ids, 404 no such result, 503 not configured (`ALIGN_FUNCTION` unset).
+- **Storage.** `alignments/{sessionId}/{jobId}/{key}.{json,afa,nwk}`, where `key` is `default` or `ids-<hash>`. A separate prefix, so `history` never lists them. A `running` status older than 5 minutes reads as failed.
+- **Cost.** ISPETase (125 sequences, 660 columns, 2 threads): FAMSA 0.7 s + FastTree 8.8 s; 83 KB alignment, 4 KB tree; about $0.0005 per search at 4096 MB. IQ-TREE was benchmarked and rejected for this path: `-fast` took 21 s, its default search ~20 min.
+- **Setup (once, admin).** After the image with `align.py` is deployed: `ACCOUNT_ID=… ./scripts/deploy/provision_align.sh` (role, function, invoke grants, `ALIGN_FUNCTION` on the aggregator and orchestrator), then add the function to the CI role (`infra/iam/github-actions-deploy-update.json`); until then the deploy step skips it with a notice.
+
 ### Cleanup & lifecycle
 
 Each search writes an immutable, `jobId`-addressed result tree under `results/{sessionId}/{jobId}/`, and `results/{sessionId}.index` is overwritten to point at the newest `jobId`. Nothing garbage-collects the previous `jobId` trees, and version-aware re-keying (above) deliberately orphans every prior `sessionId` — so without reaping, the bulky per-shard `parts/*.tsv` + `*.meta.json` and `timing.json` accumulate indefinitely.
@@ -407,6 +417,7 @@ petadex-sequence-search/
 │   ├── aggregator.py             # DIAMOND: merge parts → sort → top-K → enrich → write result + timing
 │   ├── common.py                 # Shared FASTA parse/validate + SEARCH_VERSION / RESULT_DEPTH constants
 │   ├── metadata.py               # Tier-A enrichment: hit cards + summary from the metadata store
+│   ├── align.py                  # alignment + tree after each search (FAMSA + FastTree), read via the `align` action
 │   └── cli.py                    # Local DIAMOND search against any local DB (no AWS; JSON to stdout)
 ├── data/
 │   └── example-sequences.txt     # IsPETase, FAST-PETase, SRR10663367 — regenerated on every deploy
@@ -426,6 +437,7 @@ petadex-sequence-search/
 │   │   └── striped_corpus_sample.py      # Corpus-size sampling for shard-count sizing
 │   ├── deploy/                   # Provisioning & operations
 │   │   ├── provision_diamond_infra.sh    # One-time admin: create the 3 Lambdas + state machine + IAM
+│   │   ├── provision_align.sh            # One-time admin: the alignment + tree Lambda (src/align.py)
 │   │   ├── set_worker_env.py             # Update worker env vars without clobbering the rest
 │   │   ├── smoke_test.sh                 # Invoke the live orchestrator and poll for the result
 │   │   └── validate_pinned_version.py    # Site examples pinned to a version vs LATEST; fails on cross-version hits

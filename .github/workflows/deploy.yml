@@ -89,7 +89,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.version.outputs.new_tag }}
         run: |
-          for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-aggregator; do
+          for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-aggregator petadex-diamond-align; do
             if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
               echo "Updating $FN -> $IMAGE_TAG"
               aws lambda update-function-code --function-name "$FN" \

@@ -62,6 +62,22 @@ RUN set -eu; \
 # Verify DIAMOND installation
 RUN diamond version
 
+# Alignment + tree for src/align.py (the results page's Alignment tab):
+# FAMSA ships a static arm64 binary; FastTree is one C file, built with OpenMP
+# (uses the Lambda's vCPUs via OMP_NUM_THREADS) and double precision (stable
+# branch lengths for near-identical sequences). Both pinned to release tags.
+ARG FAMSA_VERSION=2.5.2
+ARG FASTTREE_VERSION=2.2.0
+RUN set -eu; \
+    wget -qO famsa.tar.gz \
+      "https://github.com/refresh-bio/FAMSA/releases/download/v${FAMSA_VERSION}/famsa-v${FAMSA_VERSION}-arm64_linux.tar.gz"; \
+    tar xzf famsa.tar.gz famsa; install -m 0755 famsa /usr/local/bin/famsa; rm -f famsa famsa.tar.gz; \
+    wget -qO FastTree.c "https://raw.githubusercontent.com/morgannprice/fasttree/v${FASTTREE_VERSION}/FastTree.c"; \
+    gcc -Wall -O3 -finline-functions -funroll-loops -DOPENMP -fopenmp -DUSE_DOUBLE \
+      -o /usr/local/bin/FastTree FastTree.c -lm; \
+    rm -f FastTree.c
+RUN famsa 2>&1 | grep -q "^FAMSA" && FastTree -expert 2>&1 | grep -q "FastTree 2.2.0 Double precision"
+
 # Install Python dependencies
 COPY requirements.txt .
 # Use --no-cache-dir to ensure we don't pull a broken build attempt
