@@ -173,6 +173,32 @@ try:
 except ValueError:
     check("malformed id raises", True)
 
+print("\n=== samples batch ===")
+sb = metadata.samples_batch(["LG7", "LG8", "NR5", "LG7"], store_uri=sroot)
+check("batch ok", sb["status"] == "ok" and sb["store"] == "test_samples" and sb["limit"] == 50, sb["status"])
+check("batch per-id statuses", {k: v["status"] for k, v in sb["results"].items()} == {"LG7": "ok", "LG8": "not_found", "NR5": "not_applicable"})
+check("batch rows are refs with typed numbers", sb["results"]["LG7"]["samples"] == [["SAMN2", 4, 12.5], ["SAMEA9", 1, 3.0]])
+check("batch keeps true totals", sb["results"]["LG7"]["n_biosamples"] == 3 and sb["results"]["LG7"]["n_bioprojects"] == 2)
+check("batch biosample records once each", sorted(sb["biosamples"]) == ["SAMEA9", "SAMN2"] and sb["biosamples"]["SAMN2"]["profile"] == "soil")
+check("batch study titles", sb["bioprojects"] == {"PRJEB3": "Tara Oceans", "PRJNA1": "Soil survey"})
+check("batch limit trims rows", metadata.samples_batch(["LG7"], limit=1, store_uri=sroot)["results"]["LG7"]["samples"] == [["SAMN2", 4, 12.5]])
+check("batch no store -> unavailable", metadata.samples_batch(["LG7"], store_uri="")["status"] == "unavailable")
+for bad_args, what in (([], "empty"), ("LG7", "not a list"), (["LG7", "WP_1.1"], "malformed id"),
+                       (["LG7"] * 501, "too many ids"), (["LG7", 7], "non-string id")):
+    try:
+        metadata.samples_batch(bad_args, store_uri=sroot); check(f"batch rejects {what}", False)
+    except ValueError:
+        check(f"batch rejects {what}", True)
+for lim in (0, 201, "5", True):
+    try:
+        metadata.samples_batch(["LG7"], limit=lim, store_uri=sroot); check(f"batch rejects limit {lim!r}", False)
+    except ValueError:
+        check(f"batch rejects limit {lim!r}", True)
+check("keywords match recorded text", metadata.keywords({"isolation_source": "Activated sludge, WWTP"}) == ["waste"])
+check("keywords use the study title", metadata.keywords({"isolation_source": "soil"}, "PET bottle plastisphere") == ["plastic"])
+check("keywords: none for plain text", metadata.keywords({"isolation_source": "soil", "host": None}) == [])
+check("keywords: 'dumped' is not 'dump'", metadata.keywords({"isolation_source": "dumped soil"}) == [])
+
 with mock.patch("boto3.client", return_value=mock.MagicMock()):
     sys.modules.pop("orchestrator", None)
     import orchestrator  # noqa: E402
@@ -181,8 +207,19 @@ with mock.patch.dict(os.environ, {"SAMPLES_STORE": sroot}):
     bad = orchestrator.handler({"action": "samples", "id": "nonsense"}, None)
     missing = orchestrator.handler({"action": "samples", "id": "LG8"}, None)
     notlg = orchestrator.handler({"action": "samples", "id": "NR5"}, None)
+    bok = orchestrator.handler({"action": "samples", "ids": ["LG7", "NR5"], "limit": 1}, None)
+    bbad = orchestrator.handler({"action": "samples", "ids": ["LG7", "nonsense"]}, None)
+    bbody = orchestrator.handler({"body": json.dumps({"action": "samples", "ids": ["LG7"]})}, None)
 with mock.patch.dict(os.environ, {"SAMPLES_STORE": ""}):
     nostore = orchestrator.handler({"action": "samples", "id": "LG7"}, None)
+    bnostore = orchestrator.handler({"action": "samples", "ids": ["LG7"]}, None)
+check("orchestrator batch -> 200", bok["statusCode"] == 200 and json.loads(bok["body"])["results"]["LG7"]["samples"] == [["SAMN2", 4, 12.5]], bok.get("statusCode"))
+check("orchestrator batch malformed -> 400", bbad["statusCode"] == 400, bbad.get("statusCode"))
+check("orchestrator batch via API body -> 200", bbody["statusCode"] == 200, bbody.get("statusCode"))
+check("orchestrator batch no store -> 503", bnostore["statusCode"] == 503, bnostore.get("statusCode"))
+with mock.patch.dict(os.environ, {"SAMPLES_STORE": sroot}), mock.patch.object(orchestrator, "BATCH_RESPONSE_MAX", 10):
+    big = orchestrator.handler({"action": "samples", "ids": ["LG7"]}, None)
+check("orchestrator batch over the size cap -> 400", big["statusCode"] == 400 and "too large" in json.loads(big["body"])["error"], big.get("statusCode"))
 check("not_found -> 404", missing["statusCode"] == 404, missing.get("statusCode"))
 check("non-Logan id -> 400", notlg["statusCode"] == 400, notlg.get("statusCode"))
 check("no store configured -> 503", nostore["statusCode"] == 503, nostore.get("statusCode"))
