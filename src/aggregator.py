@@ -46,6 +46,23 @@ from common import (EXPORT_COLUMNS, EXPORT_DEPTH, EXPORT_EVALUE_BANDS,
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 s3 = boto3.client("s3", region_name="us-east-1")
+# The alignment + tree Lambda (src/align.py), started after every search result
+# is written. Unset = no automatic tree (the orchestrator's `align` action still answers).
+ALIGN_FUNCTION = os.environ.get("ALIGN_FUNCTION")
+
+
+def start_alignment(session_id, job_id):
+    """Start the default alignment + tree in the background. Never raises: the search is already done."""
+    if not ALIGN_FUNCTION:
+        return False
+    try:
+        boto3.client("lambda", region_name="us-east-1").invoke(
+            FunctionName=ALIGN_FUNCTION, InvocationType="Event",
+            Payload=json.dumps({"sessionId": session_id, "jobId": job_id}))
+        return True
+    except Exception as e:
+        print(f"WARN could not start the alignment: {type(e).__name__}: {e}")
+        return False
 
 
 def parse_part(text):
@@ -489,6 +506,7 @@ def handler(event, context):
                   Body=job_id, ContentType="text/plain")
     phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
     print(f"wrote {len(results)} results -> s3://{S3_BUCKET}/{result_key}")
+    start_alignment(session_id, job_id)   # after the write: the page already has its hits
 
     phase_ms["total_ms"] = round(sum(v for v in phase_ms.values() if isinstance(v, (int, float))), 1)
 

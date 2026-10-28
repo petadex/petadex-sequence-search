@@ -59,6 +59,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
+import align
 import metadata
 from common import (EXPORT_DEPTH, RESULT_DEPTH, SEARCH_VERSION,
                     export_session_id, parse_database_release, parse_fasta,
@@ -71,6 +72,9 @@ STATE_MACHINE_ARN = os.environ.get("STATE_MACHINE_ARN")
 
 s3 = boto3.client("s3", region_name="us-east-1")
 sfn = boto3.client("stepfunctions", region_name="us-east-1")
+lam = boto3.client("lambda", region_name="us-east-1")
+# The alignment + tree Lambda (src/align.py). Unset = the `align` action answers 503.
+ALIGN_FUNCTION = os.environ.get("ALIGN_FUNCTION")
 
 # Admission limits for PUBLIC searches (events carrying `clientIp`, i.e. relayed
 # by the petadex.io backend). Every admitted search fans out 32 workers, so an
@@ -391,6 +395,55 @@ def get_history(session_id):
 BATCH_RESPONSE_MAX = 5_000_000
 
 
+def align_action(body, session_id):
+    """Alignment + tree for a finished search: {sessionId, jobId?, ids?, poll?}.
+
+    The default alignment is started by the aggregator after every search; this
+    returns it (status none | running | ready | failed; `afa` + `newick` when
+    ready). With `ids` (<= align.MAX_HITS hits of that result) it is a custom
+    alignment, started here on first request. A missing or failed one is
+    (re)started unless `poll` is true. jobId defaults to the session's latest job.
+    200 any status · 400 bad ids · 404 no such result · 503 not configured.
+    """
+    try:
+        ids = align.validate_ids(body.get("ids"))
+    except ValueError as e:
+        return _resp(400, {"error": str(e)})
+    job_id = body.get("jobId")
+    if not job_id:
+        try:
+            job_id = s3.get_object(Bucket=S3_BUCKET, Key=f"results/{session_id}.index")["Body"].read().decode().strip()
+        except s3.exceptions.NoSuchKey:
+            return _resp(404, {"status": "none", "error": "no search result for this sessionId"})
+    result_key = f"results/{session_id}/{job_id}.json"
+    key = align.key_for(ids)
+    doc = align.read_status(session_id, job_id, key)
+    if doc and doc["status"] == "ready":
+        afa, nwk = align.read_outputs(session_id, job_id, key)
+        return _resp(200, {**doc, "afa": afa, "newick": nwk})
+    if doc and doc["status"] == "running":
+        return _resp(200, doc)
+    if body.get("poll"):
+        return _resp(200, doc or {"status": "none", "session_id": session_id, "job_id": job_id, "key": key})
+    if not ALIGN_FUNCTION:
+        return _resp(503, {"status": "unavailable", "error": "alignment is not configured"})
+    try:
+        result = json.loads(s3.get_object(Bucket=S3_BUCKET, Key=result_key)["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return _resp(404, {"status": "none", "error": "no such search result"})
+    try:
+        n = len(align.select(result, ids))
+    except ValueError as e:
+        return _resp(400, {"error": str(e)})
+    # Mark it running before the async start, so a second poll doesn't start it twice.
+    running = {"status": "running", "session_id": session_id, "job_id": job_id, "key": key,
+               "started_at": align._now(), "n_sequences": n}
+    align._put_status(session_id, job_id, key, running)
+    lam.invoke(FunctionName=ALIGN_FUNCTION, InvocationType="Event",
+               Payload=json.dumps({"sessionId": session_id, "jobId": job_id, "ids": ids}))
+    return _resp(200, running)
+
+
 def _resp(status, body):
     return {
         "statusCode": status,
@@ -443,6 +496,9 @@ def handler(event, context):
 
         if action == "history":
             return _resp(200, {"history": get_history(session_id)})
+
+        if action == "align":
+            return align_action(body, session_id)
 
         # --- export: every significant hit, on demand (common.EXPORT_DEPTH) ---
         # Same request as a search (sessionId = the search's cache key). A
