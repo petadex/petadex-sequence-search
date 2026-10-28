@@ -388,6 +388,9 @@ def get_history(session_id):
     return history
 
 
+BATCH_RESPONSE_MAX = 5_000_000
+
+
 def _resp(status, body):
     return {
         "statusCode": status,
@@ -417,6 +420,15 @@ def handler(event, context):
         # no search, no sessionId. The lookup's status maps to the HTTP status the
         # petadex.io route relays: ok 200, not_found 404 (a Logan id with no linked
         # BioSample), not_applicable / malformed id 400, unavailable 503 (no store).
+        # With `ids` (a list, up to 500) it is the batch form: ok 200, malformed 400, unavailable 503.
+        if action == "samples" and "ids" in body:
+            try:
+                res = metadata.samples_batch(body.get("ids"), limit=body.get("limit"))
+            except ValueError as e:
+                return _resp(400, {"error": str(e)})
+            if len(json.dumps(res)) > BATCH_RESPONSE_MAX:   # Lambda's sync response cap is 6 MB
+                return _resp(400, {"error": "response too large; lower `limit` or send fewer ids"})
+            return _resp(200 if res["status"] == "ok" else 503, res)
         if action == "samples":
             try:
                 res = metadata.samples(body.get("id"))

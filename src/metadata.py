@@ -26,6 +26,7 @@ import bisect
 import gzip
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -215,6 +216,17 @@ def enrich(results, database_release=None, store_uri=None):
 
 
 # ---- "Found in Samples": the BioSamples one Logan sequence was assembled in ----
+# Recorded-text keywords: a literal match on a BioSample's own record and study title, nothing inferred.
+KEYWORDS = {
+    "saline": re.compile(r"hypersaline|saltern|salt (lake|marsh|pan)|brine|halophil|soda lake|saline", re.I),
+    "hot": re.compile(r"hot spring|hydrothermal|geotherm|thermophil|compost|hot water|geyser|solfatar", re.I),
+    "waste": re.compile(r"landfill|\bdump\b|waste ?water|sewage|activated sludge|compost|garbage|refuse|wwtp", re.I),
+    "plastic": re.compile(r"plastic|polyethylene|polyester|polyurethane|polystyrene|polypropylene"
+                          r"|\bpet (film|bottle|flake|powder|plastic)|plastisphere|\bpbat\b", re.I),
+}
+KEYWORD_FIELDS = ["isolation_source", "env_broad_scale", "env_medium", "host"]
+BATCH_MAX_IDS = 500
+BATCH_DEFAULT_LIMIT, BATCH_MAX_LIMIT = 50, 200
 SAMPLE_FIELDS = ["bioproject", "profile", "profile_evidence", "isolation_source", "env_broad_scale", "env_medium",
                  "host", "country", "latitude", "longitude", "temperature_c", "ph"]
 
@@ -267,4 +279,66 @@ def samples(petadex_id, store_uri=None):
             **{f: rec.get(f) for f in SAMPLE_FIELDS if f != "bioproject"},
             "top_species": [[n, _num(s, float)] for n, s in (rec.get("top_species") or [])],
         })
+    return out
+
+
+def keywords(rec, title=None):
+    """The KEYWORDS whose pattern occurs in a BioSample's recorded text or its study title."""
+    text = " ".join(str(rec.get(f)) for f in KEYWORD_FIELDS if rec.get(f)) + (f" {title}" if title else "")
+    return [k for k, rx in KEYWORDS.items() if rx.search(text)]
+
+
+def samples_batch(ids, limit=None, store_uri=None):
+    """Found in Samples for many sequences at once (a search's Logan hits), in three store reads.
+
+    Returns {status, store, sample_cap, limit, results, biosamples, bioprojects}:
+    `results[id]` = {status, n_biosamples, n_bioprojects, samples: [[biosample, n_runs, ka_max], ...]}
+    holding each id's first `limit` BioSamples by run count (the true totals stay in n_*);
+    `biosamples[bs]` = the record once per BioSample (SAMPLE_FIELDS, top_species, keywords);
+    `bioprojects[bp]` = study title. Per-id status: ok | not_found | not_applicable.
+    Overall status: ok | unavailable (no store). Raises ValueError on a malformed request."""
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("ids must be a non-empty list")
+    if len(ids) > BATCH_MAX_IDS:
+        raise ValueError(f"at most {BATCH_MAX_IDS} ids per request")
+    limit = BATCH_DEFAULT_LIMIT if limit is None else limit
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= BATCH_MAX_LIMIT:
+        raise ValueError(f"limit must be an integer 1-{BATCH_MAX_LIMIT}")
+    parsed = {}
+    for i in ids:
+        p = parse_target(i) if isinstance(i, str) else None
+        if p is None:
+            raise ValueError(f"not a petadex_id: {i!r}")
+        parsed[i] = p
+    out = {"status": "unavailable", "limit": limit, "results": {}, "biosamples": {}, "bioprojects": {}}
+    uri = store_uri if store_uri is not None else os.environ.get("SAMPLES_STORE")
+    if not uri:
+        return out
+    store = open_store(uri)
+    out.update(status="ok", store=store.tag, sample_cap=store.manifest.get("sample_cap"))
+    lg = {i: p for i, p in parsed.items() if p[0] == "LG"}
+    lgs, _ = store.lookup([("LGS", p[1], i) for i, p in lg.items()])
+    want_bs, want_bp = {}, set()   # biosample -> its study, from the sequence's own sample rows
+    for i, p in parsed.items():
+        if p[0] != "LG":
+            out["results"][i] = {"status": "not_applicable"}
+            continue
+        card = lgs.get(i)
+        if not card:
+            out["results"][i] = {"status": "not_found", "n_biosamples": 0, "n_bioprojects": 0, "samples": []}
+            continue
+        rows = (card.get("samples") or [])[:limit]
+        want_bs.update((r[0], r[1]) for r in rows)
+        want_bp.update(r[1] for r in rows if r[1])
+        out["results"][i] = {"status": "ok", "n_biosamples": card.get("n_biosamples", len(rows)),
+                             "n_bioprojects": card.get("n_bioprojects"),
+                             "samples": [[b, _num(n, int), _num(k, float)] for b, _, n, k in rows]}
+    bs, _ = store.lookup([("BS", b, b) for b in sorted(want_bs)])
+    bp, _ = store.lookup([("BP", x, x) for x in sorted(want_bp)])
+    out["bioprojects"] = {x: (bp.get(x) or {}).get("title") for x in sorted(want_bp)}
+    for b in sorted(want_bs):
+        rec = bs.get(b) or {}
+        out["biosamples"][b] = {**{f: rec.get(f) for f in SAMPLE_FIELDS}, "bioproject": rec.get("bioproject") or want_bs[b],
+                                "top_species": [[n, _num(s, float)] for n, s in (rec.get("top_species") or [])],
+                                "keywords": keywords(rec, out["bioprojects"].get(want_bs[b]))}
     return out
