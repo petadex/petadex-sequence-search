@@ -28,13 +28,16 @@ def check(name, cond, detail=""):
 
 print("parse_part")
 rows = aggregator.parse_part(
-    "t1\t1\t100\t5\t104\t100\t87.5\t1e-50\t200.0\tMKLV\n"
+    "t1\t1\t100\t5\t104\t100\t87.5\t1e-50\t200.0\tMKLV\t40AG59\n"
+    "t3\t1\t10\t1\t10\t10\t100.0\t1e-3\t20.0\tMKLVAAAAAA\n"   # 10-column part (pre-1.6.0 worker)
     "t2\t1\t50\t1\t50\t50\t40.0\t1e-5\t60.0\n"   # 9-column part from an older worker
     "\n")
-check("two rows parsed", len(rows) == 2)
+check("three rows parsed", len(rows) == 3)
 check("pident passed through un-scaled", rows[0]["percent_identity"] == 87.5)
 check("full_sseq -> target_sequence", rows[0]["target_sequence"] == "MKLV")
-check("9-column row -> target_sequence None", rows[1]["target_sequence"] is None)
+check("9-column row -> target_sequence None", rows[2]["target_sequence"] is None)
+check("btop column -> btop", rows[0]["btop"] == "40AG59")
+check("10-column row -> btop None", rows[1]["btop"] is None and rows[1]["target_sequence"] == "MKLVAAAAAA")
 try:
     aggregator.parse_part("t\t1\t2\t1\t2\t2\t150\t1\t1\n")
     check("pident > 100 rejected", False)

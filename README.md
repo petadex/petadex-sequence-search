@@ -143,7 +143,7 @@ results/{sessionId}/{jobId}/parts/shard_N.meta.json# per-shard timing sidecar
 results/{sessionId}/{jobId}/timing.json            # job-level timing rollup
 ```
 
-The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `result_depth`, `db_sequence_count`. Since `search_version` 1.5.0 each hit's `metadata` is its card from the metadata store (see [Metadata enrichment](#metadata-enrichment)), and the result adds `enrichment_status`, `metadata_version`, `clusters` and `summary`.
+The result JSON keeps `{ query_header, query_sequence, query_length, num_results, results[] }` (each hit: `target_id, query_start, query_end, target_start, target_end, alignment_length, percent_identity, evalue, bitscore, target_sequence, btop, metadata`), plus **additive identity stamps** the web app may ignore or render: `engine` (`diamond`), `database`, `database_release`, `database_version`, `search_version`, `result_depth`, `db_sequence_count`. Since `search_version` 1.5.0 each hit's `metadata` is its card from the metadata store (see [Metadata enrichment](#metadata-enrichment)), and the result adds `enrichment_status`, `metadata_version`, `clusters` and `summary`; since 1.6.0 each hit also carries `btop` (its alignment, below).
 
 Two JSON objects are written per job: the **search result** (`{jobId}.json`) and a separate **timing diagnostic** rollup (`{jobId}/timing.json`). Both schemas are below.
 
@@ -222,6 +222,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `evalue` | float | Expectation value, calibrated against the **full corpus** (not the local shard) via `--dbsize`. |
 | `bitscore` | float | DIAMOND bit-score. **Primary ranking key.** |
 | `target_sequence` | string \| null | **Full amino-acid sequence of the matched target** (DIAMOND's `full_sseq`) — the complete subject protein, not just the aligned segment, so it is typically longer than `alignment_length`. Added in `search_version` 1.3.0; `null` only for a hit merged from a part written by an older worker. |
+| `btop` | string | DIAMOND's Blast trace-back over `query_start`–`query_end` / `target_start`–`target_end` (1.6.0+): a number = that many identical residues, a letter pair = query then target residue at a mismatch, `-` = gap. A target letter may read `X` where DIAMOND masked a low-complexity stretch; take the residue from `target_sequence`. ISPETase: 500/500 hits rebuild exactly; ~80 KB per 500 hits. |
 | `metadata` | object \| null | RDS-enriched annotation; `null` when the target has no RDS match (the usual case for Logan ORF IDs — see below). |
 
 Coordinates follow DIAMOND's outfmt-6 default: **1-based, inclusive** on both query and target.
