@@ -57,7 +57,7 @@ ap.add_argument("--hierarchy", default="/watson/rnalab/dzhu/petadex-clustering/r
 ap.add_argument("--c60-stats", default="/watson/rnalab/dzhu/petadex-clustering/results/cluster_stats_60.tsv")
 ap.add_argument("--c90", default=None, help="cluster_c90.parquet (default: <meta-s3>/data/joint/)")
 ap.add_argument("--c30", default=None, help="cluster_c30.parquet (default: <meta-s3>/data/joint/)")
-ap.add_argument("--block-rows", type=int, default=2000)
+ap.add_argument("--block-rows", type=int, default=500)   # 500: ~40 % faster lookups than 2000 (in-region, 2026-10-28)
 ap.add_argument("--mem", default="24GB")
 ap.add_argument("--threads", type=int, default=16)
 ap.add_argument("--tmp", default="/tmp/petadex_metadata_store_tmp")
