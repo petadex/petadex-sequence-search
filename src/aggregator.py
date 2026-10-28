@@ -8,11 +8,9 @@ abort the execution before this state), so all `parts/shard_*.tsv` are present.
 
 It merges the per-shard partial TSVs, ranks globally, truncates to the job's
 search depth (`maxResults` in the execution input = common.RESULT_DEPTH),
-enriches from RDS once, and writes the result in the UNCHANGED shape the web app
-already consumes — `results/{sessionId}/{jobId}.json` + `results/{sessionId}.index`.
-
-It is the only search component that touches RDS, so `fetch_metadata` lives
-here.
+enriches the hits from the metadata store (metadata.py), and writes the result in
+the shape the web app already consumes — `results/{sessionId}/{jobId}.json` +
+`results/{sessionId}.index` — with additive enrichment fields.
 
 Input (the execution state after the Map; see orchestrator.py):
     { "sessionId", "jobId", "queryHeader", "querySequence", "maxResults", ... }
@@ -22,11 +20,13 @@ legacy MMseqs2 path does `fident*100`; that must NOT be re-applied here. We
 assert `0 ≤ pident ≤ 100` per row — the designated place to catch the
 silent-corruption bug.
 
-METADATA CAVEAT: `fetch_metadata` joins `blast_nr_metadata.genbank_accession_id`,
-but full-Logan-corpus target IDs are ORF IDs (e.g. `114593962||ERR1748848|...`),
-not GenBank accessions — so enrichment will usually return `null` for the Logan
-corpus. The contract already permits `metadata: null`; the round-trip is kept
-per the plan. A real Logan-corpus metadata source is a separate, future concern.
+ENRICHMENT (search_version 1.5.0): every v260701 hit id (`PL…`/`NR…`/`LG…`) is
+looked up in the metadata store named by METADATA_STORE (built by
+scripts/db/build_metadata_store.py; replaces the RDS `blast_nr_metadata` join,
+which matched GenBank accessions and so returned null for every v260701 hit).
+Each hit gets its card as `metadata`; the result gains `enrichment_status`,
+`metadata_version`, `clusters` (cards of the hits' 90/60/30 % clusters) and a
+hit-set `summary`. A failed lookup never fails the search (status "failed").
 """
 
 import gzip
@@ -40,52 +40,12 @@ from datetime import datetime, timezone
 import boto3
 from boto3.s3.transfer import TransferConfig
 
+import metadata
 from common import (EXPORT_COLUMNS, EXPORT_DEPTH, EXPORT_EVALUE_BANDS,
                     EXPORT_FORMAT_VERSION, export_rank_key, hit_origin)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
-DB_HOST = os.environ.get("DB_HOST", "petadex.ccz9y6yshbls.us-east-1.rds.amazonaws.com")
-DB_NAME = os.environ.get("DB_NAME", "petadex")
-
 s3 = boto3.client("s3", region_name="us-east-1")
-_db_secret_cache = None
-
-
-def get_db_credentials():
-    global _db_secret_cache
-    if _db_secret_cache:
-        return _db_secret_cache
-    sm = boto3.client("secretsmanager", region_name="us-east-1")
-    secret = json.loads(sm.get_secret_value(
-        SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
-    _db_secret_cache = secret
-    return secret
-
-
-def fetch_metadata(accession_ids):
-    """Fetch blast_nr_metadata rows for a list of genbank_accession_ids."""
-    if not accession_ids:
-        return {}
-    import psycopg2
-    import psycopg2.extras
-    creds = get_db_credentials()
-    conn = psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME,
-        user=creds["username"], password=creds["password"],
-        connect_timeout=5,
-    )
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """SELECT genbank_accession_id, organism, protein_id, definition,
-                          taxonomy, journal, collection_date, country
-                   FROM blast_nr_metadata
-                   WHERE genbank_accession_id = ANY(%s)""",
-                (list(accession_ids),),
-            )
-            return {row["genbank_accession_id"]: dict(row) for row in cur.fetchall()}
-    finally:
-        conn.close()
 
 
 def parse_part(text):
@@ -474,15 +434,14 @@ def handler(event, context):
     results = results[:max_results]
     phase_ms["sort_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
-    # Enrich once from RDS (see METADATA CAVEAT). Timed so we can see exactly how
-    # much of the tail this round-trip costs — including a slow/failed RDS
-    # connect, which would otherwise be invisible.
+    # Enrich from the metadata store (see ENRICHMENT). Timed so the tail shows
+    # how much of it is the lookup; never raises.
     t0 = time.monotonic()
-    accession_ids = {r["target_id"] for r in results}
-    metadata = fetch_metadata(accession_ids)
+    enr = metadata.enrich(results, database_release=event.get("databaseRelease"))
     for r in results:
-        r["metadata"] = metadata.get(r["target_id"])
+        r["metadata"] = enr["cards"].get(r["target_id"])
     phase_ms["metadata_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    phase_ms["metadata_detail"] = enr["timing"]
 
     result_doc = {
         "query_header": query_header,
@@ -513,6 +472,12 @@ def handler(event, context):
         "database_version": event.get("version"),
         "search_version": event.get("searchVersion"),
         "db_sequence_count": event.get("dbSequenceCount"),
+        # Enrichment (1.5.0): status, the store build that answered, cluster cards
+        # and the hit-set summary. All additive; null when unavailable or failed.
+        "enrichment_status": enr["status"],
+        "metadata_version": enr["store"],
+        "clusters": enr["clusters"],
+        "summary": enr["summary"],
         "results": results,
     }
     t0 = time.monotonic()
@@ -525,7 +490,7 @@ def handler(event, context):
     phase_ms["write_result_ms"] = round((time.monotonic() - t0) * 1000, 1)
     print(f"wrote {len(results)} results -> s3://{S3_BUCKET}/{result_key}")
 
-    phase_ms["total_ms"] = round(sum(phase_ms.values()), 1)
+    phase_ms["total_ms"] = round(sum(v for v in phase_ms.values() if isinstance(v, (int, float))), 1)
 
     # Roll the per-shard timing sidecars into job-level timing.json. AFTER the
     # result write (off the critical path) and never raises — see write_job_timing.

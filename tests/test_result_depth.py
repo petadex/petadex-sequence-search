@@ -1,4 +1,4 @@
-"""Validation for the fixed-depth search change (SEARCH_VERSION 1.4.0).
+"""Validation for the fixed-depth search change (SEARCH_VERSION 1.5.0).
 
 Standalone (no pytest): `python3 tests/test_result_depth.py`. S3/SFN/RDS are
 stubbed, so this exercises the real orchestrator/aggregator code paths without
@@ -64,7 +64,7 @@ def load_orchestrator():
 
 
 print("\n=== common.py ===")
-check("SEARCH_VERSION bumped to 1.4.0", common.SEARCH_VERSION == "1.4.0", common.SEARCH_VERSION)
+check("SEARCH_VERSION bumped to 1.5.0", common.SEARCH_VERSION == "1.5.0", common.SEARCH_VERSION)
 check("RESULT_DEPTH defined and positive", isinstance(common.RESULT_DEPTH, int) and common.RESULT_DEPTH > 0)
 check("RESULT_DEPTH == 500 (matches web-app Joi cap)", common.RESULT_DEPTH == 500, str(common.RESULT_DEPTH))
 
@@ -82,14 +82,14 @@ for requested in (10, 50, 400, None):
           cap.get("maxResults") == common.RESULT_DEPTH, f"got {cap.get('maxResults')}")
     check(f"max_results={requested} -> HTTP 200", resp["statusCode"] == 200)
 
-check("execution input still carries searchVersion 1.4.0", cap.get("searchVersion") == "1.4.0")
+check("execution input still carries searchVersion 1.5.0", cap.get("searchVersion") == "1.5.0")
 check("execution input unchanged otherwise (shards/dbSize/version)",
       len(cap.get("shards", [])) == 2 and cap.get("dbSize") == 104940484545 and cap.get("version") == "V1")
 
 print("\n=== orchestrator: version action reports result_depth ===")
 v = json.loads(orch.handler({"action": "version"}, None)["body"])
 check("version action returns result_depth", v.get("result_depth") == common.RESULT_DEPTH, str(v))
-check("version action returns search_version 1.4.0", v.get("search_version") == "1.4.0")
+check("version action returns search_version 1.5.0", v.get("search_version") == "1.5.0")
 check("version action still returns database_version/release",
       v.get("database_version") == "V1" and v.get("database_release") == "v1.1")
 check("version action needs no sessionId", "error" not in v)
@@ -124,7 +124,6 @@ def run_aggregator(depth, n_hits_per_shard, n_shards=2):
         sys.modules.pop("aggregator", None)
         import aggregator
     aggregator.s3 = s3
-    aggregator.fetch_metadata = lambda ids: {}
 
     aggregator.handler({
         "sessionId": "s1", "jobId": "j1", "querySequence": SEQ, "queryHeader": "query",
@@ -142,7 +141,7 @@ check("truncated to depth", doc["num_results"] == 500, str(doc["num_results"]))
 check("num_results == len(results)", doc["num_results"] == len(doc["results"]))
 check("ranked by bitscore desc", all(
     doc["results"][i]["bitscore"] >= doc["results"][i + 1]["bitscore"] for i in range(len(doc["results"]) - 1)))
-check("search_version 1.4.0 stamped", doc.get("search_version") == "1.4.0")
+check("search_version 1.5.0 stamped", doc.get("search_version") == "1.5.0")
 check("target_sequence still stamped (1.3.0 field intact)", doc["results"][0].get("target_sequence") == "MKLLV")
 
 # exhaustive case: fewer hits than depth
