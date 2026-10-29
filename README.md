@@ -466,7 +466,7 @@ petadex-sequence-search/
 │   │   ├── validate_export.py            # Live export check against the deployed functions
 │   │   └── validate_pinned_version.py    # Site examples pinned to a version vs LATEST; fails on cross-version hits
 │   ├── ops/setup_search_alarms.sh        # Idempotent alarm + SNS + ntfy relay setup
-│   ├── batch/                    # Many-protein batch search: 32 direct worker invokes, multi-query FASTA
+│   ├── batch/                    # (local-only, gitignored) many-protein batch search via direct worker invokes
 │   ├── bench/                    # Benchmarks against the live/devtest stack
 │   │   ├── bench_result_depth.py         # Search cost vs result depth (-k)
 │   │   ├── bench_full_vs_cores.sh        # Full-length vs catalytic-core search DB (v260701 decision)

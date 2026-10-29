@@ -211,6 +211,7 @@ __marimo__/
 CLAUDE.md
 .claude/*
 archive/*
+scripts/batch/
 06 DB-Format Streaming Benchmark.md
 
 # AWS credentials and sensitive data
