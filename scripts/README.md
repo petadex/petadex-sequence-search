@@ -5,6 +5,8 @@ Building, validating and operating the sharded DIAMOND search database.
 ## Files
 
 **Database (`db/`)**
+- **[build_metadata_store.py](db/build_metadata_store.py)** - builds the v260701 metadata store (hit cards, cluster cards) the aggregator enriches from (runs on EC2)
+- **[build_samples_store.py](db/build_samples_store.py)** - builds the Found-in-Samples store behind the `samples` action (runs on EC2)
 - **[build_diamond_shards.py](db/build_diamond_shards.py)** - partitions a corpus FASTA into shards, builds each (`.fa.zst` or `.dmnd`), uploads them under `diamond/{version}/`, writes `manifest.json`, and moves `LATEST` last (unless `--no-bump-latest`)
 - **[assemble_v260701_corpus.py](db/assemble_v260701_corpus.py)** - assembles the v260701 full-length and catalytic-core corpora (`>petadex_id` headers) from the dataset-generation outputs
 - **[verify_v260701_corpus.sh](db/verify_v260701_corpus.sh)** - independent record-by-record check of those corpora against the source files
@@ -15,11 +17,13 @@ Building, validating and operating the sharded DIAMOND search database.
 
 **Deploy and validation (`deploy/`)**
 - **[provision_diamond_infra.sh](deploy/provision_diamond_infra.sh)** - one-time creation of the orchestrator/worker/aggregator and state machine
+- **[provision_align.sh](deploy/provision_align.sh)** - one-time creation of the align Lambda, its role, invoke grants and `ALIGN_FUNCTION` env
 - **[set_worker_env.py](deploy/set_worker_env.py)** - worker environment changes
 - **[smoke_test.sh](deploy/smoke_test.sh)** - one search end to end through the live orchestrator
+- **[validate_export.py](deploy/validate_export.py)** - live export check against the deployed functions
 - **[validate_pinned_version.py](deploy/validate_pinned_version.py)** - runs the site examples pinned to a version and against `LATEST`; fails on any hit from the wrong version
 
-**Benchmarks (`bench/`)** - `bench_full_vs_cores.sh` (search DB choice), `bench_result_depth.py`, `export_e2e.py` (export vs search on real shards, no AWS), and the Stage 2/3 dev-build runbooks.
+**Benchmarks (`bench/`)** - `bench_full_vs_cores.sh` (search DB choice), `bench_result_depth.py`, `export_e2e.py` (export vs search on real shards, no AWS), `sensitivity_recall.py` (default vs `--very-sensitive` recall by identity bin), and the Stage 2/3 dev-build runbooks.
 
 **Operations (`ops/`)**
 - **[setup_search_alarms.sh](ops/setup_search_alarms.sh)** - creates/updates the search CloudWatch alarms and their SNS → ntfy relay (idempotent; `--test` sends one push)
@@ -57,6 +61,24 @@ s3://petadex/diamond/LATEST                     # → {version}  (written LAST)
 ```
 
 Workers resolve the version once per job (`LATEST`, or the request's `version`) and cache shards in `/tmp` under the full S3 key, so a new version needs no Lambda redeploy, and two versions never share a cached shard.
+
+**Batch (`batch/`, local-only, gitignored)** - many-protein batch search via 32 direct worker invokes with a multi-query FASTA.
+
+## Sharded database layout
+
+```
+s3://petadex/diamond/
+├── LATEST                                    # text pointer → current version dir
+└── {version}/                                # e.g. petadex_seq_v260701_20261026_202443
+    ├── manifest.json                         # version, database_release, total_letters, per-shard key/sequences/letters/bytes
+    ├── shard_00.fa.zst  (~779 MB)            # 32 shards, ~9.33M sequences / ~2.756G residues each
+    ├── ...
+    └── shard_31.fa.zst
+```
+
+The corpus FASTA is split round-robin, so shards are even to one sequence and a target lives in exactly one shard. Each shard is zstd level 19; DIAMOND (built with zstd support) reads it directly as its database. Earlier builds (`catalytic_orfs_v1.1_*`: 20 `.dmnd` shards until 2026-06-26, then 32 zstd shards) came from `s3://petadex/logan/petadex.catalytic_orfs.v1.1.fa`.
+
+**Atomic versioning** (prevents mid-rebuild races): write all shards, then `manifest.json`, **then** update `LATEST`. The orchestrator reads `LATEST` once per job and passes the resolved version into the execution, so all workers pin to one version even if `LATEST` flips mid-job. Old versions are removed with `reap_old_diamond_versions.sh` (LATEST-aware, dry-run by default), never by an age rule.
 
 ## Removed
 

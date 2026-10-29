@@ -1,4 +1,4 @@
-# PETadex sequence-search — DIAMOND scale-out data flow
+# PETadex sequence-search: DIAMOND scale-out data flow
 # Render:  d2 --theme 200 --sketch infra/architecture.d2 infra/architecture.svg
 # (theme 200 = "Dark Mauve"; --sketch gives the hand-drawn, non-generic look)
 #
@@ -10,15 +10,15 @@
 
 direction: down
 
-# Legend (native d2 legend — rendered in its own box, excluded from layout).
+# Legend (native d2 legend, rendered in its own box, excluded from layout).
 # Mirrors the styling below: amber = compute, blue = stores; solid = sync flow,
 # dashed = async return / poll.
 vars: {
   d2-legend: {
-    compute: "Compute — Lambda / Step Functions" {
+    compute: "Compute: Lambda / Step Functions" {
       style: { fill: "#3b2f12"; stroke: "#f59e0b"; text-transform: none }
     }
-    store: "Storage — S3" {
+    store: "Storage: S3" {
       shape: cylinder
       style: { fill: "#1f2937"; stroke: "#60a5fa"; text-transform: none }
     }
@@ -41,7 +41,7 @@ orch: "⚙️ Orchestrator Lambda\n\n• validate + parse FASTA once\n• admiss
 
 s3db: "🗄️ S3 · diamond/{version}/\n32 × shard_NN.fa.zst + manifest" { shape: cylinder }
 
-sfn: "🔀 Step Functions · Map — 32 workers / search\n(reserved concurrency 200 · ≤ 4 public searches at once)" {
+sfn: "🔀 Step Functions · Map · 32 workers / search\n(reserved concurrency 200 · ≤ 4 public searches at once)" {
   direction: right
   w0: "Worker\nshard 0"
   w1: "Worker\nshard 1"
