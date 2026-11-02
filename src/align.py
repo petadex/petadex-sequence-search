@@ -13,7 +13,8 @@ Sequences come from the result itself (`query_sequence` + every hit's
               every Plasticome hit and the best-ranked hit of each 90 % cluster
               (`metadata.c90`), capped at MAX_HITS; the status doc's `groups`
               maps each tree leaf to the aligned hits of its cluster
-    ids       an explicit list (<= MAX_HITS) of hits from that result, all treed
+    ids       an explicit list (<= MAX_IDS) of hits from that result, all treed;
+              the web app's "full tree" sends every hit (~1 min at 500 on Lambda)
 
 FAMSA aligns, FastTree (-lg -gamma) builds the tree from the tree rows of that
 same alignment (all-gap columns dropped). FastTree is the cost (superlinear: 22
@@ -40,7 +41,8 @@ import boto3
 S3_BUCKET = os.environ.get("S3_BUCKET", "petadex")
 FAMSA_BIN = os.environ.get("FAMSA_BIN", "famsa")
 FASTTREE_BIN = os.environ.get("FASTTREE_BIN", "FastTree")
-MAX_HITS = 200
+MAX_HITS = 200   # leaves of the default tree
+MAX_IDS = 500    # hits in a custom (ids) request: a whole RESULT_DEPTH result
 STALE_RUNNING_S = 300   # a "running" status older than this is treated as failed (the Lambda died)
 TOOL_TIMEOUT_S = 240
 MAX_THREADS = int(os.environ.get("ALIGN_THREADS", "4"))   # Lambda reports its 2-6 vCPUs; a big host must not spawn hundreds
@@ -60,13 +62,13 @@ def key_for(ids):
 
 
 def validate_ids(ids):
-    """None, or a non-empty list of <= MAX_HITS distinct strings; raises ValueError otherwise."""
+    """None, or a non-empty list of <= MAX_IDS distinct strings; raises ValueError otherwise."""
     if ids is None:
         return None
     if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
         raise ValueError("ids must be a non-empty list of petadex_ids")
-    if len(set(ids)) > MAX_HITS:
-        raise ValueError(f"at most {MAX_HITS} ids")
+    if len(set(ids)) > MAX_IDS:
+        raise ValueError(f"at most {MAX_IDS} ids")
     return ids
 
 

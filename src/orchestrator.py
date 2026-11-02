@@ -400,7 +400,7 @@ def align_action(body, session_id):
 
     The default alignment is started by the aggregator after every search; this
     returns it (status none | running | ready | failed; `afa` + `newick` when
-    ready). With `ids` (<= align.MAX_HITS hits of that result) it is a custom
+    ready). With `ids` (<= align.MAX_IDS hits of that result) it is a custom
     alignment, started here on first request. A missing or failed one is
     (re)started unless `poll` is true. jobId defaults to the session's latest job.
     200 any status · 400 bad ids · 404 no such result · 503 not configured.

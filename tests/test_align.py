@@ -87,9 +87,10 @@ for bad in ([], "PL1", [1], [""]):
     except ValueError:
         check(f"validate_ids rejects {bad!r}", True)
 try:
-    align.validate_ids([f"LG{i}" for i in range(201)]); check("validate_ids rejects > 200", False)
+    align.validate_ids([f"LG{i}" for i in range(501)]); check("validate_ids rejects > 500", False)
 except ValueError:
-    check("validate_ids rejects > 200", True)
+    check("validate_ids rejects > 500", True)
+check("validate_ids accepts a whole 500-hit result", len(align.validate_ids([f"LG{i}" for i in range(500)])) == 500)
 
 print("\n=== run ===")
 s3.put_object(Bucket="b", Key="results/s/j.json", Body=json.dumps(RESULT))
