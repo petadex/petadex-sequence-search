@@ -62,16 +62,24 @@ RESULT = {"query_sequence": SEQ, "database_version": "V", "search_version": "1.6
 
 print("\n=== select / keys ===")
 names = [n for n, _ in align.select(RESULT)]
-check("default: query, Plasticome, best hit per c90, no-sequence hits dropped",
-      names == ["query", "PL1", "PL2", "LG1", "LG3", "LG5"], names)
+check("default aligns the query + every hit with a sequence, rank order",
+      names == ["query", "PL1", "NR1", "PL2", "LG1", "LG2", "LG3", "LG5"], names)
+groups = align.tree_groups(RESULT)
+check("default tree: query, Plasticome, best hit per c90; the rest under their cluster's leaf",
+      groups == {"query": [], "PL1": ["NR1"], "PL2": [], "LG1": ["LG2"], "LG3": [], "LG5": []}, groups)
+check("ids tree: every id a leaf", align.tree_groups(RESULT, ["LG2", "PL1"]) == {"query": [], "PL1": [], "LG2": []})
+sub = align.sub_alignment(">a\nA-C-\n>b\nA--G\n>c\nAT--\n", ["a", "b"])
+check("sub_alignment keeps the named rows, drops their all-gap columns", sub == ">a\nAC-\n>b\nA-G\n", sub)
 check("ids: those hits in rank order", [n for n, _ in align.select(RESULT, ["LG5", "PL1"])] == ["query", "PL1", "LG5"])
 try:
     align.select(RESULT, ["PL1", "NR999"]); check("ids outside the result rejected", False)
 except ValueError:
     check("ids outside the result rejected", True)
 with mock.patch.object(align, "MAX_HITS", 2):
-    check("default capped at MAX_HITS hits", len(align.select(RESULT)) == 3)
-check("default key", align.key_for(None) == "default")
+    g = align.tree_groups(RESULT)
+    check("default tree capped at MAX_HITS leaves; hits past the cap under no leaf",
+          g == {"query": [], "PL1": ["NR1"], "PL2": []} and len(align.select(RESULT)) == 8, g)
+check("default key", align.key_for(None) == "default-v2")
 check("ids key is order-free", align.key_for(["A", "B"]) == align.key_for(["B", "A", "A"]) and align.key_for(["A"]).startswith("ids-"))
 for bad in ([], "PL1", [1], [""]):
     try:
@@ -85,18 +93,21 @@ except ValueError:
 
 print("\n=== run ===")
 s3.put_object(Bucket="b", Key="results/s/j.json", Body=json.dumps(RESULT))
-fake_build = lambda seqs, threads=None: ("".join(f">{n}\n{q}\n" for n, q in seqs), "(" + ",".join(n for n, _ in seqs) + ");\n", {"famsa_ms": 1, "fasttree_ms": 1})
+fake_build = lambda seqs, tree_names=None, threads=None: ("".join(f">{n}\n{q}\n" for n, q in seqs), "(" + ",".join(tree_names or [n for n, _ in seqs]) + ");\n", {"famsa_ms": 1, "fasttree_ms": 1})
 with mock.patch.object(align, "build", align.build if REAL else fake_build):
     doc = align.run("s", "j")
 check("run -> ready", doc["status"] == "ready", doc.get("error"))
-check("status stored", json.loads(s3.store["alignments/s/j/default.json"])["status"] == "ready")
-afa, nwk = align.read_outputs("s", "j", "default")
+check("status stored", json.loads(s3.store["alignments/s/j/default-v2.json"])["status"] == "ready")
+afa, nwk = align.read_outputs("s", "j", "default-v2")
 heads = [l[1:] for l in afa.splitlines() if l.startswith(">")]
-check("afa headers = query + petadex_ids", heads == ["query", "PL1", "PL2", "LG1", "LG3", "LG5"], heads)
+check("afa headers = query + every hit", heads == ["query", "PL1", "NR1", "PL2", "LG1", "LG2", "LG3", "LG5"], heads)
 check("afa rows equal length", len({len(r) for r in afa.split(">")[1:] for r in ["".join(r.split("\n")[1:])]}) == 1)
 leaves = sorted(x.strip("()").split(":")[0] for x in nwk.strip().rstrip(";").replace("(", ",").replace(")", ",").split(",") if x.strip("() ").split(":")[0])
-check("newick leaves = afa headers", set(heads) <= set(leaves), leaves)
-check("ready doc records ids, columns, versions", doc["ids"] == heads[1:] and doc["n_columns"] > 0 and doc["search_version"] == "1.6.0")
+leaves = [x for x in leaves if not x.replace(".", "").isdigit()]   # real FastTree writes support values
+check("newick leaves = the tree's hits", leaves == sorted(["query", "PL1", "PL2", "LG1", "LG3", "LG5"]), leaves)
+check("ready doc records ids, tree size, groups, columns, versions",
+      doc["ids"] == heads[1:] and doc["n_tree"] == 6 and doc["groups"] == {"PL1": ["NR1"], "LG1": ["LG2"]}
+      and doc["n_columns"] > 0 and doc["search_version"] == "1.6.0", doc)
 bad = align.run("s", "missing-job")
 check("run on a missing result -> failed, not raised", bad["status"] == "failed" and "NoSuchKey" in bad["error"], bad.get("error"))
 

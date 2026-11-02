@@ -1,7 +1,7 @@
 """Alignment + tree for a finished search (the results page's Alignment tab).
 
 The aggregator starts this Lambda in the background right after it writes a
-search result (`key = "default"`), so the default tree is usually ready by the
+search result (`key = DEFAULT_KEY`), so the default tree is usually ready by the
 time anyone asks; the orchestrator's `align` action reads its status, and
 starts a custom one for an explicit `ids` list. A search never waits on it and
 never fails because of it.
@@ -9,19 +9,23 @@ never fails because of it.
 Sequences come from the result itself (`query_sequence` + every hit's
 `target_sequence`), so nothing is read from the corpus:
 
-    default   the query, every Plasticome hit, and the best-ranked hit of each
-              90 % cluster (`metadata.c90`), in rank order, capped at MAX_HITS
-    ids       an explicit list (<= MAX_HITS) of hits from that result
+    default   alignment: the query and every hit, in rank order. Tree: the query,
+              every Plasticome hit and the best-ranked hit of each 90 % cluster
+              (`metadata.c90`), capped at MAX_HITS; the status doc's `groups`
+              maps each tree leaf to the aligned hits of its cluster
+    ids       an explicit list (<= MAX_HITS) of hits from that result, all treed
 
-FAMSA aligns, FastTree (-lg -gamma) builds the tree. Outputs, next to nothing
-else so `history` never sees them:
+FAMSA aligns, FastTree (-lg -gamma) builds the tree from the tree rows of that
+same alignment (all-gap columns dropped). FastTree is the cost (superlinear: 22
+leaves 1.1 s, 200 leaves 18 s, 500 leaves 58 s on the 4096 MB Lambda), FAMSA is
+not (500 sequences 3.4 s), hence the split. Outputs, next to nothing else so
+`history` never sees them:
 
     alignments/{sessionId}/{jobId}/{key}.json  status: running | ready | failed
     alignments/{sessionId}/{jobId}/{key}.afa   aligned FASTA, headers = petadex_id, query = ">query"
     alignments/{sessionId}/{jobId}/{key}.nwk   Newick, same leaf names, branch lengths kept
 
-ISPETase (125 sequences, 660 columns, 2 threads on watson): FAMSA 1.9 s,
-FastTree 6.9 s; ~85 KB .afa, ~5 KB .nwk.
+SRR10663367 (501 aligned, 22 treed, 1186 columns): ~5 s; ~600 KB .afa, ~1 KB .nwk.
 """
 import hashlib
 import json
@@ -43,10 +47,15 @@ MAX_THREADS = int(os.environ.get("ALIGN_THREADS", "4"))   # Lambda reports its 2
 s3 = boto3.client("s3", region_name="us-east-1")
 
 
+# v2 = every hit aligned (v1 `default` aligned only the tree's hits). A new key, so
+# stored v1 alignments are rebuilt on their next request instead of served.
+DEFAULT_KEY = "default-v2"
+
+
 def key_for(ids):
-    """`default` for the default selection, else a stable hash of the id list (order-free)."""
+    """DEFAULT_KEY for the default selection, else a stable hash of the id list (order-free)."""
     if ids is None:
-        return "default"
+        return DEFAULT_KEY
     return "ids-" + hashlib.sha256("\n".join(sorted(set(ids))).encode()).hexdigest()[:16]
 
 
@@ -65,14 +74,7 @@ def select(result, ids=None):
     """[(name, sequence)] for the alignment: the query first, then hits in rank order."""
     hits = [h for h in result["results"] if h.get("target_sequence")]
     if ids is None:
-        seen, pick = set(), []
-        for h in hits:
-            c90 = (h.get("metadata") or {}).get("c90")
-            if h["target_id"].startswith("PL") or c90 is None or c90 not in seen:
-                pick.append(h)
-            if c90 is not None:
-                seen.add(c90)
-        pick = pick[:MAX_HITS]
+        pick = hits
     else:
         by_id = {h["target_id"]: h for h in hits}
         missing = sorted(set(ids) - set(by_id))
@@ -83,8 +85,43 @@ def select(result, ids=None):
     return [("query", result["query_sequence"])] + [(h["target_id"], h["target_sequence"]) for h in pick]
 
 
-def build(seqs, threads=None):
-    """FAMSA then FastTree on [(name, seq)] -> (afa text, newick text, timing)."""
+def tree_groups(result, ids=None):
+    """{leaf: [aligned hits it stands for]} for the tree, leaves in rank order, `query` first.
+
+    Default: the query, every Plasticome hit and the best-ranked hit of each 90 %
+    cluster are leaves (capped at MAX_HITS hits); every other aligned hit is listed
+    under its cluster's leaf, or under no leaf if that leaf fell past the cap.
+    With ids every aligned hit is a leaf."""
+    names = [n for n, _ in select(result, ids)]
+    if ids is not None:
+        return {n: [] for n in names}
+    c90 = {h["target_id"]: (h.get("metadata") or {}).get("c90") for h in result["results"]}
+    groups, leaf_of = {"query": []}, {}
+    for n in names[1:]:
+        c = c90.get(n)
+        if n.startswith("PL") or c is None or c not in leaf_of:
+            if len(groups) <= MAX_HITS:
+                groups[n] = []
+                if c is not None:
+                    leaf_of.setdefault(c, n)
+            continue
+        groups[leaf_of[c]].append(n)
+    return groups
+
+
+def sub_alignment(afa_text, names):
+    """The rows of `names` from an aligned FASTA, columns that are all gaps there dropped."""
+    rows = {}
+    for block in afa_text.split(">")[1:]:
+        head, _, body = block.partition("\n")
+        rows[head.strip()] = body.replace("\n", "")
+    keep = [rows[n] for n in names]
+    cols = [i for i in range(len(keep[0])) if any(r[i] != "-" for r in keep)]
+    return "".join(f">{n}\n{''.join(r[i] for i in cols)}\n" for n, r in zip(names, keep))
+
+
+def build(seqs, tree_names=None, threads=None):
+    """FAMSA on [(name, seq)], then FastTree on the `tree_names` rows (default all) -> (afa, newick, timing)."""
     threads = threads or min(os.cpu_count() or 1, MAX_THREADS)
     timing = {}
     with tempfile.TemporaryDirectory() as d:
@@ -94,13 +131,18 @@ def build(seqs, threads=None):
         t0 = time.monotonic()
         subprocess.run([FAMSA_BIN, "-t", str(threads), src, afa], check=True, capture_output=True, timeout=TOOL_TIMEOUT_S)
         timing["famsa_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        with open(afa) as f:
+            afa_text = f.read()
+        tree_in = afa
+        if tree_names is not None and len(tree_names) < len(seqs):
+            tree_in = os.path.join(d, "tree.afa")
+            with open(tree_in, "w") as f:
+                f.write(sub_alignment(afa_text, tree_names))
         t0 = time.monotonic()
-        tree = subprocess.run([FASTTREE_BIN, "-lg", "-gamma", "-quiet", afa], check=True, capture_output=True,
+        tree = subprocess.run([FASTTREE_BIN, "-lg", "-gamma", "-quiet", tree_in], check=True, capture_output=True,
                               text=True, timeout=TOOL_TIMEOUT_S,
                               env={**os.environ, "OMP_NUM_THREADS": str(threads)}).stdout.strip()
         timing["fasttree_ms"] = round((time.monotonic() - t0) * 1000, 1)
-        with open(afa) as f:
-            afa_text = f.read()
     if not tree.endswith(";"):
         raise RuntimeError("FastTree returned no tree")
     return afa_text, tree + "\n", timing
@@ -150,14 +192,16 @@ def run(session_id, job_id, ids=None):
         obj = s3.get_object(Bucket=S3_BUCKET, Key=f"results/{session_id}/{job_id}.json")
         result = json.loads(obj["Body"].read())
         seqs = select(result, ids)
-        if len(seqs) < 3:
-            raise ValueError("fewer than 3 sequences to align")
-        afa, nwk, timing = build(seqs)
+        groups = tree_groups(result, ids)
+        if len(groups) < 3:
+            raise ValueError("fewer than 3 sequences to tree")
+        afa, nwk, timing = build(seqs, list(groups))
         p = prefix(session_id, job_id)
         s3.put_object(Bucket=S3_BUCKET, Key=f"{p}/{key}.afa", Body=afa, ContentType="text/plain")
         s3.put_object(Bucket=S3_BUCKET, Key=f"{p}/{key}.nwk", Body=nwk, ContentType="text/plain")
         doc = {**base, "status": "ready", "finished_at": _now(), "n_sequences": len(seqs),
-               "ids": [n for n, _ in seqs[1:]], "n_columns": len(afa.split(">")[1].split("\n", 1)[1].replace("\n", "")),
+               "ids": [n for n, _ in seqs[1:]], "n_tree": len(groups),
+               "groups": {k: v for k, v in groups.items() if v}, "n_columns": len(afa.split(">")[1].split("\n", 1)[1].replace("\n", "")),
                "database_version": result.get("database_version"), "search_version": result.get("search_version"),
                "timing": timing}
     except Exception as e:   # recorded for the poller, never raised to Lambda (no retries of a bad input)
