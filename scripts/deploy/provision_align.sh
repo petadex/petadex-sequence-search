@@ -4,7 +4,7 @@
 # lets the aggregator + orchestrator invoke it and read/write alignments/*, and sets ALIGN_FUNCTION
 # on both, merging into their existing environment (update-function-configuration replaces it whole).
 # Run after the image that contains align.py + FAMSA + FastTree is deployed:
-#   ACCOUNT_ID=797308887321 ./scripts/deploy/provision_align.sh
+#   ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text) ./scripts/deploy/provision_align.sh
 set -euo pipefail
 ACCOUNT_ID="${ACCOUNT_ID:?set ACCOUNT_ID}"
 REGION="${AWS_REGION:-us-east-1}"; export AWS_DEFAULT_REGION="$REGION"

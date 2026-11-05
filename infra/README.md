@@ -32,7 +32,7 @@ AWS resources around the search: the Step Functions definition, IAM policies, th
 One ARM64 image serves all roles. Pushes to `main` build and deploy via GitHub Actions (`deploy.yml`):
 1. Bumps the semver tag
 2. Builds a `linux/arm64` image (on a native arm64 runner, with GHA layer cache, since the DIAMOND source compile is slow under QEMU) and pushes to ECR
-3. `update-function-code` on the four DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator,align}`), then updates the Step Functions state-machine definition (the CI role can't yet, so apply ASL changes by hand). Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
+3. `update-function-code` on the four DIAMOND functions (`petadex-diamond-{orchestrator,worker,aggregator,align}`), then updates the Step Functions state-machine definition. Each DIAMOND step no-ops with a `::notice::` if the resource isn't provisioned yet, so a push never breaks the pipeline.
 4. Regenerates the example searches.
 
 Docs-only commits can skip the rebuild with `[skip ci]` in the commit message.
@@ -63,7 +63,15 @@ for FN in petadex-diamond-orchestrator petadex-diamond-worker petadex-diamond-ag
 done
 ```
 
-> **The CI deploy role can't update the state machine yet**: the step skips with a notice, so apply ASL changes by hand (`aws stepfunctions update-state-machine`; updates are eventually consistent). Container Lambdas pin an image digest; after a deploy, check that `ResolvedImageUri` advanced.
+**CI deploy role permissions.** The deploy steps run as `petadex-github-actions-role`, whose inline policy `petadex-diamond-deploy-update` is [iam/github-actions-deploy-update.json](iam/github-actions-deploy-update.json). The deploy silently skips (with a notice) any function or state machine the role can't `get-function`/`describe`, and fails if it can't `GetFunctionConfiguration` (the `wait function-updated` step). Keep the applied policy equal to the file. Like every policy here, the file uses `REPLACE_ACCOUNT_ID`, so substitute before applying (admin IAM):
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+sed "s|REPLACE_ACCOUNT_ID|$ACCOUNT_ID|g" infra/iam/github-actions-deploy-update.json > /tmp/deploy-update.json
+aws iam put-role-policy --role-name petadex-github-actions-role \
+  --policy-name petadex-diamond-deploy-update --policy-document file:///tmp/deploy-update.json
+```
+
+> State machine updates are eventually consistent. Container Lambdas pin an image digest; after a deploy, check that all four functions' `ResolvedImageUri` advanced.
 
 ## Cleanup & lifecycle
 

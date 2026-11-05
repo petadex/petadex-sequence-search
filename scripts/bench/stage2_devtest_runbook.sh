@@ -32,7 +32,7 @@ set -euo pipefail
 
 # ---- Config -----------------------------------------------------------------
 REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT="${AWS_ACCOUNT:-797308887321}"
+ACCOUNT="${AWS_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text)}"
 ECR_REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 ECR_REPO="petadex-mmseq2-search"                 # existing worker image repo
 DEV_SHA="4b2ae056851d28585ec7d3067ebaaaebdc7fbaac"
