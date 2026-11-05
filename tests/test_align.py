@@ -75,6 +75,12 @@ try:
     align.select(RESULT, ["PL1", "NR999"]); check("ids outside the result rejected", False)
 except ValueError:
     check("ids outside the result rejected", True)
+EXPORT = {"kind": "export", "total_hits": 7_900_000, "files": {}}
+for ids in (None, ["PL1"]):
+    try:
+        align.select(EXPORT, ids); check(f"an export summary is rejected (ids={ids})", False)
+    except ValueError:
+        check(f"an export summary is rejected (ids={ids})", True)
 with mock.patch.object(align, "MAX_HITS", 2):
     g = align.tree_groups(RESULT)
     check("default tree capped at MAX_HITS leaves; hits past the cap under no leaf",

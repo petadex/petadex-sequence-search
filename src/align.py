@@ -74,6 +74,9 @@ def validate_ids(ids):
 
 def select(result, ids=None):
     """[(name, sequence)] for the alignment: the query first, then hits in rank order."""
+    if not isinstance(result.get("results"), list) or "query_sequence" not in result:
+        # an export summary (kind "export") has no hits here: its millions are in hits.fasta.gz
+        raise ValueError(f"not a search result ({result.get('kind', 'no hits list')})")
     hits = [h for h in result["results"] if h.get("target_sequence")]
     if ids is None:
         pick = hits
