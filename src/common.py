@@ -54,7 +54,13 @@ import re
 #           query-vs-hit residues and a conservation track. Same hits and
 #           ranking, ~100 KB more per 500-hit result; bump so cached 1.5.0
 #           results (no btop) are not served.
-SEARCH_VERSION = "1.6.0"
+#   1.7.0 — Metadata store rebuilt on the Run 2 clustering (2026-11-04): every
+#           hit's c90 / c60 / c30 and the result's `clusters` now name Run 2
+#           clusters (the same clusters the petadex.io cluster pages show), and
+#           the Plasticome / nr cards come from the promoted fix2 metadata.
+#           Same hits and ranking, different payload, so this MUST bump: cached
+#           1.6.0 results carry Run 1 cluster labels.
+SEARCH_VERSION = "1.7.0"
 
 # Depth of the SEARCH itself — how many hits every job computes and stores,
 # regardless of how many the caller asks to display. Set once here, injected by

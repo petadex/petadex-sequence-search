@@ -140,7 +140,7 @@ Response:
 {
   "database_version": "petadex_seq_v260701_20261026_202443",
   "database_release": "v260701",
-  "search_version": "1.6.0",
+  "search_version": "1.7.0",
   "result_depth": 500
 }
 ```
@@ -168,7 +168,7 @@ Every search is labelled by **two independent version axes**, both stamped into 
 | Axis | Result field(s) | What it tracks | Changes when |
 |---|---|---|---|
 | **Database** | `database_release` (`v260701`, human label) + `database_version` (`petadex_seq_v260701_20261026_202443`, precise build tag) | The corpus searched against. `database_release` is parsed from the corpus filename (`PETadex.seq.v260701.fa`) and labels every shard via the manifest; `database_version` pins the exact build. | The corpus is rebuilt/republished (new data, re-sharding). `database_version` changes on *every* rebuild; `database_release` only on a new release (`v1.1` → `v260701`). |
-| **Search** | `search_version` (`1.6.0`, semver) | The search pipeline: engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus, e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, a scoring change, or a payload change (1.5.0 metadata store, 1.6.0 `btop`). |
+| **Search** | `search_version` (`1.7.0`, semver) | The search pipeline: engine, sensitivity flag, block size, scoring/`--dbsize` calibration. Defined as the `SEARCH_VERSION` constant in [common.py](common.py) and bumped by hand. | The search changes results for the *same* query against the *same* corpus, e.g. the sensitivity switch (`--very-sensitive` → default), an engine swap, a scoring change, or a payload change (1.5.0 metadata store, 1.6.0 `btop`, 1.7.0 Run 2 clusters). |
 
 Both axes are needed because either one alone leaves a staleness hole: a corpus bump invalidates results the database axis catches, but a pipeline change (same corpus, different sensitivity) is invisible to it, and that's what `search_version` covers.
 
@@ -185,7 +185,7 @@ The key must encode the versions a *fresh* search **would** run with (current co
 ```jsonc
 // request:  { "action": "version" }   (no sessionId: it's what you call to BUILD one)
 // response: { "database_version": "petadex_seq_v260701_20261026_202443",
-//             "database_release": "v260701", "search_version": "1.6.0",
+//             "database_release": "v260701", "search_version": "1.7.0",
 //             "result_depth": 500 }
 ```
 
@@ -220,7 +220,7 @@ Two benign properties, noted so they aren't mistaken for bugs:
 | `database` | string | S3 path of the source corpus FASTA the shards were built from (`s3://petadex/diamond/corpus/PETadex.seq.v260701.fa`). |
 | `database_release` | string \| null | **Human-facing corpus version**, e.g. `v260701` (earlier `v1.1`) (parsed from the corpus filename). The display label for "which database." `null` if the corpus name carries no `vN` token. See [Versioning & cache invalidation](#versioning--cache-invalidation). |
 | `database_version` | string | **Precise build tag** of the corpus (e.g. `petadex_seq_v260701_20261026_202443`). Pins the result to one exact build of a release and changes on *every* rebuild, even within the same `database_release`. This is the corpus identifier the cache key should use. |
-| `search_version` | string | **Search-pipeline version** (semver, e.g. `1.6.0`), independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
+| `search_version` | string | **Search-pipeline version** (semver, e.g. `1.7.0`), independent of the corpus. Bumps when the search itself changes results for the same query against the same corpus (engine, sensitivity, block-size, scoring). See [Versioning & cache invalidation](#versioning--cache-invalidation). |
 | `db_sequence_count` | int | **Sequence** count across all shards (298,687,346). This is the corpus size for reference; it is *not* the e-value `--dbsize`, which is a **residue** count (88.18B residues ≈ 295.2 × 298,687,346 sequences; see Scoring & e-values). |
 | `enrichment_status` · `metadata_version` · `clusters` · `summary` | | Metadata-store enrichment (1.5.0+); see [Metadata enrichment](#metadata-enrichment). |
 | `results` | array | Hit list, ranked by bit-score descending, then e-value ascending. |
