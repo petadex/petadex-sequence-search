@@ -19,7 +19,7 @@ fetches only the blocks its hits fall in (src/metadata.py), so a lookup is a
 handful of small ranged GETs instead of a database round-trip.
 
 Sources (all v260701, see the vault "PETadex Metadata v260701"):
-  - clusters      petadex-clustering Run 1 hierarchy.tsv (domain -> c90/c60/c30)
+  - clusters      petadex-clustering Run 2 hierarchy_run2.parquet (domain -> c90/c60/c30)
   - PL            metadata data/t1/plasticome_metadata.parquet (with the curation sheet)
   - NR            data/t2/id_organism + id_biosample + nr_header (in_clustering)
   - LG            s3 .../data/t3/lg_metadata/bucket=*/data.parquet
@@ -53,7 +53,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True)
 ap.add_argument("--meta", default="/watson/rnalab/dzhu/petadex-metadata-v260701/data")
 ap.add_argument("--meta-s3", default="s3://automated-metadata/metadata-v260701/repo")
-ap.add_argument("--hierarchy", default="/watson/rnalab/dzhu/petadex-clustering/results/hierarchy.tsv")
+ap.add_argument("--hierarchy", default="/watson/rnalab/dzhu/petadex-clustering/run2/products/hierarchy_run2.parquet",
+                help="domain -> c90/c60/c30 (Run 2 Parquet, or Run 1 TSV)")
 ap.add_argument("--c60-stats", default="/watson/rnalab/dzhu/petadex-clustering/results/cluster_stats_60.tsv")
 ap.add_argument("--c90", default=None, help="cluster_c90.parquet (default: <meta-s3>/data/joint/)")
 ap.add_argument("--c30", default=None, help="cluster_c30.parquet (default: <meta-s3>/data/joint/)")
@@ -81,6 +82,9 @@ q1 = lambda sql: con.execute(sql).fetchone()
 
 # ---- 1. clusters: one row per protein (its first core by domain_id), partitioned like lg_metadata
 CL = f"{WORK}/clusters"
+# Run 2's hierarchy is Parquet (petadex-clustering run2/products/hierarchy_run2.parquet); Run 1's was TSV.
+hier_src = (f"read_parquet('{a.hierarchy}')" if a.hierarchy.endswith(".parquet")
+            else f"read_csv('{a.hierarchy}', delim='\t', header=true, quote='', all_varchar=true)")
 if not os.path.exists(f"{CL}/_done"):
     shutil.rmtree(CL, ignore_errors=True)
     con.execute(f"""copy (
@@ -88,7 +92,7 @@ if not os.path.exists(f"{CL}/_done"):
                case when petadex_id like 'LG%' then cast(substr(petadex_id, 3) as bigint) // {BUCKET} else 0 end bucket,
                count(*)::int n_cores, arg_min(component, domain_id) component,
                arg_min(c90, domain_id) c90, arg_min(c60, domain_id) c60, arg_min(c30, domain_id) c30
-        from read_csv('{a.hierarchy}', delim='\t', header=true, quote='', all_varchar=true)
+        from {hier_src}
         group by petadex_id) to '{CL}' (format parquet, partition_by (ns, bucket))""")
     open(f"{CL}/_done", "w").close()
 cl = lambda ns, b="*": f"read_parquet('{CL}/ns={ns}/bucket={b}/*.parquet')"
